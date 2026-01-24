@@ -40,8 +40,8 @@
 #define FIFO_PERMS_MIN      0600
 
 /* Ograniczenia statyczne (dla wersji wstępnej). */
-#define MAX_P               32      /* TODO: jeżeli chcesz dynamiczne P>MAX_P, przebudowac struktury (offsety w SHM). */
-#define MAX_KI              256     /* TODO: jeżeli Ki może być większe, zwiększyc lub przejsc na alokację dynamiczną. */
+#define MAX_P               15      
+#define MAX_KI              64     
 
 #define CASHIERS            3
 
@@ -72,6 +72,10 @@
     }                                              \
 } while (0)
 
+#define LOGF(rola, fmt, ...) do { \
+    fprintf(stdout, "[%s pid=%d] " fmt "\n", rola, (int)getpid(), ##__VA_ARGS__); \
+    fflush(stdout); \
+} while (0)
 /* =========================
  *  Struktury danych w SHM
  * ========================= */
@@ -82,18 +86,23 @@ typedef struct Conveyor {
     int head;                     /* indeks odczytu */
     int tail;                     /* indeks zapisu */
     int count;                    /* liczba sztuk na podajniku */
-    int items[MAX_KI];            /* TODO: przejsc na dynamiczną pojemność per produkt */
+    int items[MAX_KI];            
 } Conveyor;
+
+typedef struct Product {
+    char nazwa[64];            /* nazwa produktu (UTF-8) */
+    double cena;              /* cena produktu */
+} Product;
 
 /* Konfiguracja i stan globalny */
 typedef struct BakeryState {
     /* Konfiguracja */
     int P;                        /* liczba produktów (P>10) */
     int N;                        /* max klientów w sklepie */
-    int open_hour;                /* Tp – uproszczone jako "sekunda startu" lub "godzina" (TODO) */
+    int open_hour;                /* Tp */
     int close_hour;               /* Tk */
 
-    int prices[MAX_P];            /* cena produktu i */
+    Product produkty[MAX_P];      /* lista produktów: nazwa + cena */
     int Ki[MAX_P];                /* pojemność podajnika i */
 
     /* Stan */
@@ -105,6 +114,7 @@ typedef struct BakeryState {
 
     int cashier_open[CASHIERS];       /* czy kasa jest otwarta */
     int cashier_accepting[CASHIERS];  /* czy kasa przyjmuje nowych (zamykanie = 0) */
+    int cashier_queue_len[CASHIERS];
 
     /* Statystyki */
     int produced[MAX_P];          /* ile wyprodukowano (sumarycznie) */
@@ -207,7 +217,7 @@ void shm_unlock_or_die(int sem_id);
 int rand_between(int a, int b);
 
 /* Walidacja parametrów (bakery) */
-int validate_config(int P, int N, int open_hour, int close_hour, const int* Ki, const int* prices);
+int validate_config(int P, int N, int open_hour, int close_hour, const int* Ki, const Product* produkty);
 
 /* Bezpieczna instalacja handlerów sygnałów */
 void install_signal_handlers_or_die(void (*handler)(int));

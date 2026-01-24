@@ -206,16 +206,18 @@ void msleep(int ms) {
  *  Walidacja konfiguracji
  * ========================= */
 
-int validate_config(int P, int N, int open_hour, int close_hour, const int* Ki, const int* prices) {
-    /* TODO: dopracowac walidację */
+int validate_config(int P, int N, int open_hour, int close_hour, const int* Ki, const Product* produkty) {
     if (P <= 10 || P > MAX_P) return 0;
     if (N <= 0) return 0;
+    if (N % 3 != 0) return 0;
+    if (open_hour < 0 || open_hour > 23) return 0;
+    if (close_hour < 0 || close_hour > 23) return 0;
     if (open_hour >= close_hour) return 0;
-    if (!Ki || !prices) return 0;
+    if (!Ki || !produkty) return 0;
 
     for (int i = 0; i < P; ++i) {
         if (Ki[i] <= 0 || Ki[i] > MAX_KI) return 0;
-        if (prices[i] <= 0) return 0;
+        if (produkty[i].cena <= 0.0) return 0;
     }
     return 1;
 }

@@ -13,8 +13,13 @@
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_evac = 0;
 static void handler(int sig) {
-    if (sig == SIG_EVAC) g_evac = 1;
-    g_stop = 1;
+    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; }
+    else if (sig == SIG_INV) {
+        /* inwentaryzacja: nie zatrzymuje procesów */
+        return;
+    } else {
+        g_stop = 1; /* SIGINT / SIGTERM */
+    }
 }
 
 static void print_summary(const BakeryState* st, int cashier_id) {
@@ -24,6 +29,22 @@ static void print_summary(const BakeryState* st, int cashier_id) {
         int s = st->sold_by_cashier[cashier_id][i];
         if (s > 0) fprintf(stdout, "Produkt %d: %d szt.\n", i, s);
     }
+}
+
+static void process_sale(BakeryState* st, int sem_id, int cashier_id, const ClientMsg* msg) {
+    /* Księgowanie zakupów kasjera (sztuki per produkt) */
+    shm_lock_or_die(sem_id);
+    for (int i = 0; i < msg->item_count; ++i) {
+        int pid = msg->items[i].product_id;
+        int qty = msg->items[i].quantity;
+        if (pid >= 0 && pid < st->P && qty > 0) {
+            st->sold_by_cashier[cashier_id][pid] += qty;
+        }
+        /* TODO: pełna walidacja komunikatu (item_count range, qty range) */
+    }
+    shm_unlock_or_die(sem_id);
+
+    /* TODO: "wydruk paragonu" z nazwami i cenami: st->produkty[pid].nazwa, st->produkty[pid].cena */
 }
 
 int main(int argc, char** argv) {
@@ -48,7 +69,7 @@ int main(int argc, char** argv) {
     if (h.shm_id == -1) DIE_PERROR("shmget(cashier)");
 
     
-    h.sem_id = semget(bakery_ftok_or_die(0x42), sem_count_for_P(MAX_P), IPC_PERMS_MIN);
+    h.sem_id = semget(bakery_ftok_or_die(0x42), 0, IPC_PERMS_MIN);
     if (h.sem_id == -1) DIE_PERROR("semget(cashier)");
 
     for (int i = 0; i < CASHIERS; ++i) {
@@ -59,11 +80,12 @@ int main(int argc, char** argv) {
     BakeryState* st = NULL;
     ipc_attach_or_die(&h, &st);
 
+    LOGF("kasjer", "Start pracy. Stanowisko: %d", cashier_id);
+
     while (!g_stop) {
         /* Czy sklep nadal działa? */
         shm_lock_or_die(h.sem_id);
         int store_open = st->store_open;
-        int inventory_mode = st->inventory_mode;
         int accepting = st->cashier_accepting[cashier_id];
         int opened = st->cashier_open[cashier_id];
         int evacuated = st->evacuated;
@@ -71,17 +93,85 @@ int main(int argc, char** argv) {
 
         if (evacuated) break;
 
-        /* Jeśli zamknięta – możesz spać i czekać na ponowne otwarcie lub na koniec dnia */
+        /* Zamknięcie sklepu: dokończ kolejkę i wyjdź */
+        if (!store_open) {
+            LOGF("kasjer", "Sklep zamknięty – opróżniam kolejkę i kończę pracę.");
+            while (1) {
+                ClientMsg msg;
+                ssize_t r = msgrcv(h.msg_id[cashier_id], &msg, sizeof(ClientMsg) - sizeof(long), 0, IPC_NOWAIT);
+                if (r == -1) {
+                    if (errno == ENOMSG) break;
+                    if (errno == EINTR) continue;
+                    perror("msgrcv (drain on store close)");
+                    break;
+                }
+                if (g_evac) {
+                    /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
+                    shm_lock_or_die(h.sem_id);
+                    if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
+                    shm_unlock_or_die(h.sem_id);
+                    break;
+                }
+                LOGF("kasjer", "Obsługuję klienta pid=%d (pozycji: %d)", (int)msg.client_pid, msg.item_count);
+                for (int i = 0; i < msg.item_count; ++i) {
+                    int pid = msg.items[i].product_id;
+                    int qty = msg.items[i].quantity;
+                    LOGF("kasjer", "  - %s x%d", st->produkty[pid].nazwa, qty);
+                }
+                process_sale(st, h.sem_id, cashier_id, &msg);
+                shm_lock_or_die(h.sem_id);
+                if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
+                shm_unlock_or_die(h.sem_id);
+            }
+            break;
+        }
+
+        /* Sklep otwarty */
+
+        /* Kasa fizycznie zamknięta: czekaj na ponowne otwarcie */
         if (!opened) {
             msleep(200);
-            if (!store_open) break;
             continue;
         }
 
-        /* Odbiór wiadomości: jeśli accepting=0, nadal obsłuzyc starą kolejkę, ale nie przyjmowac nowych?
-         *
-         * TODO: dopracowac, by uniknąć wyścigu w momencie zamykania.
-         */
+        if (!accepting) {
+            /* Domknięcie kolejki po zamknięciu dla nowych */
+             LOGF("kasjer", "Kasa %d nie przyjmuje nowych – kończę obsługę kolejki.", cashier_id);
+            int processed_any = 0;
+            while (1) {
+                ClientMsg msg;
+                ssize_t r = msgrcv(h.msg_id[cashier_id], &msg, sizeof(ClientMsg) - sizeof(long), 0, IPC_NOWAIT);
+                if (r == -1) {
+                    if (errno == ENOMSG) break;
+                    if (errno == EINTR) continue;
+                    perror("msgrcv (drain on close-for-new)");
+                    break;
+                }
+                processed_any = 1;
+                if (g_evac) {
+                    /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
+                    shm_lock_or_die(h.sem_id);
+                    if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
+                    shm_unlock_or_die(h.sem_id);
+                    break;
+                }
+                process_sale(st, h.sem_id, cashier_id, &msg);
+                shm_lock_or_die(h.sem_id);
+                if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
+                shm_unlock_or_die(h.sem_id);
+            }
+
+            /* Jeżeli kolejka pusta -> fizycznie zamknij kasę (proces dalej działa i może być ponownie otwarty) */
+            shm_lock_or_die(h.sem_id);
+            if (st->store_open && !st->cashier_accepting[cashier_id]) {
+                st->cashier_open[cashier_id] = 0;
+            }
+            shm_unlock_or_die(h.sem_id);
+
+            if (!processed_any) msleep(100);
+            continue;
+        }
+
         ClientMsg msg;
         ssize_t r = msgrcv(h.msg_id[cashier_id], &msg, sizeof(ClientMsg) - sizeof(long), 0, 0);
         if (r == -1) {
@@ -90,30 +180,18 @@ int main(int argc, char** argv) {
             break;
         }
 
-        /* Jeśli ewakuacja przyszła "w trakcie", nie liczyc transakcji */
-        if (g_evac) break;
+        if (g_evac) {
+            /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
+            shm_lock_or_die(h.sem_id);
+            if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
+            shm_unlock_or_die(h.sem_id);
+            break;
+        }
 
-        /* Księgowanie sprzedaży */
+        process_sale(st, h.sem_id, cashier_id, &msg);
         shm_lock_or_die(h.sem_id);
-        for (int i = 0; i < msg.item_count; ++i) {
-            int pid = msg.items[i].product_id;
-            int qty = msg.items[i].quantity;
-            if (pid >= 0 && pid < st->P && qty > 0) {
-                st->sold_by_cashier[cashier_id][pid] += qty;
-            }
-            /* TODO: walidacja komunikatu (bezpiecznie) */
-        }
+        if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
         shm_unlock_or_die(h.sem_id);
-
-        /* TODO: "wydruk paragonu" */
-        (void)accepting;
-
-        /* Jeśli sklep zamknięty i kolejka pusta, wyjdź – ale nie wiemy czy pusta bez IPC_NOWAIT.
-         * TODO: po store_open=0 przełączyc na msgrcv IPC_NOWAIT, opróżnij do ENOMSG i zakończ.
-         */
-        if (!store_open && inventory_mode) {
-            /* placeholder – prawdziwa logika w TODO */
-        }
     }
 
     /* Inwentaryzacja: jeśli inventory_mode, wypisac podsumowanie */
@@ -126,6 +204,9 @@ int main(int argc, char** argv) {
         print_summary(st, cashier_id);
         shm_unlock_or_die(h.sem_id);
     }
+
+    if (g_evac) LOGF("kasjer", "Kończę pracę (ewakuacja).");
+    else        LOGF("kasjer", "Kończę pracę.");
 
     ipc_detach_or_die(st);
     return 0;

@@ -9,10 +9,15 @@
  *  - pozostałe programy robią tylko własne funkcjonalności.
  */
 
+#define MAX_CLIENTS_TOTAL 50     
+#define SPAWN_COOLDOWN_MS 300    /* max 1 klient na 300ms */
+
 /* Flagi ustawiane w handlerze sygnału */
 static volatile sig_atomic_t g_sig_evac = 0;
 static volatile sig_atomic_t g_sig_inv  = 0;
 static volatile sig_atomic_t g_sig_term = 0;
+
+static pid_t g_pgid = -1;
 
 static void signal_handler(int sig) {
     if (sig == SIG_EVAC) g_sig_evac = 1;
@@ -51,7 +56,6 @@ static void spawn_cashiers_or_die(void) {
 }
 
 static void spawn_client_or_die(void) {
-    /* TODO: możesz przekazywać parametry klienta w argv (np. seed, id) */
     char* const argv[] = { "./client", NULL };
     (void)spawn_process_or_die("./client", argv);
 }
@@ -71,9 +75,9 @@ static int desired_open_cashiers(const BakeryState* st) {
     if (want < 1) want = 1;
     if (want > CASHIERS) want = CASHIERS;
 
-    /* Dodatkowa reguła z opisu: gdy < 2N/3, jedna kasa ma być zamknięta (zwykle wychodzi z want) */
-    /* TODO: jeśli chcesz wymusić konkretnie: gdy c < 2N/3 => want <= 2 */
+    /* gdy < 2N/3, jedna kasa ma być zamknięta */
     if (c < (2 * N) / 3 && want == 3) want = 2;
+
 
     return want;
 }
@@ -85,13 +89,13 @@ static void apply_cashier_policy(BakeryState* st, int sem_id) {
 
     /* policzyc aktualnie otwarte */
     int open = 0;
-    for (int i = 0; i < CASHIERS; ++i) if (st->cashier_open[i]) open++;
+    for (int i = 0; i < CASHIERS; ++i) {
+        if (st->cashier_open[i] && st->cashier_accepting[i]) open++;
+    }
 
-    /* TODO: strategia wyboru, które otwierać / zamykać.
-     * Propozycja:
-     *  - otwieraj od 0 w górę
-     *  - zamykac od końca (2->1->0) i ustawic cashier_accepting=0, ale cashier obsłuży swoich w kolejce.
-     */
+    /* Zawsze minimum 1 kasa przyjmuje nowych */
+    if (want < 1) want = 1;
+    if (want > CASHIERS) want = CASHIERS;
 
     /* Otwieranie */
     for (int i = 0; i < CASHIERS && open < want; ++i) {
@@ -99,20 +103,24 @@ static void apply_cashier_policy(BakeryState* st, int sem_id) {
             st->cashier_open[i] = 1;
             st->cashier_accepting[i] = 1;
             open++;
-            /* TODO: log */
+            LOGF("kierownik", "Otwarto kasę %d (przyjmuje nowych)", i);
+        } else if (!st->cashier_accepting[i]) {
+            st->cashier_accepting[i] = 1;
+            open++;
+            LOGF("kierownik", "Kasa %d znów przyjmuje nowych", i);
         }
     }
 
-    /* Zamykanie (przestaje przyjmować nowych) */
+    /* Zamykanie dla nowych – od końca (2->1->0).
+     * Nie zamykamy ostatniej kasy (min. 1).
+     */
     for (int i = CASHIERS - 1; i >= 0 && open > want; --i) {
-        if (st->cashier_open[i]) {
-            /* nigdy nie zamykac, jeśli to jedyna otwarta */
+        if (st->cashier_open[i] && st->cashier_accepting[i]) {
             if (open <= 1) break;
-
-            st->cashier_accepting[i] = 0; /* kluczowe: stara kolejka ma być obsłużona */
-            /* TODO: kasjer po opróżnieniu kolejki ustawi cashier_open[i]=0 (lub zrobi to kierownik) */
+            st->cashier_accepting[i] = 0; /* domknięcie kolejki: kasjer obsłuży obecnych w MQ */
             open--;
-            /* TODO: log */
+            LOGF("kierownik", "Kasa %d przestaje przyjmować nowych (domykanie kolejki)", i);
+
         }
     }
 
@@ -120,11 +128,10 @@ static void apply_cashier_policy(BakeryState* st, int sem_id) {
 }
 
 /* 
- FIFO sterujące (opcjonalnie)
+ FIFO sterujące 
 */
 
 static int ctrl_fifo_open_or_off(void) {
-    /* TODO: jeśli nie FIFO – usunac całkowicie i zostawic tylko sygnały */
     if (mkfifo(CTRL_FIFO_PATH, FIFO_PERMS_MIN) == -1) {
         if (errno != EEXIST) {
             perror("mkfifo(CTRL_FIFO_PATH)");
@@ -156,6 +163,20 @@ static void ctrl_fifo_poll(int fd) {
     }
 }
 
+static int current_hour_local(void) {
+    time_t t = time(NULL);
+    struct tm lt;
+    localtime_r(&t, &lt);
+    return lt.tm_hour;
+}
+
+static long long now_ms(void) {
+    struct timespec ts;
+    CHECK_SYS(clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+
 /* =========================
  *  Main
  * ========================= */
@@ -167,23 +188,43 @@ int main(int argc, char** argv) {
 
     install_signal_handlers_or_die(signal_handler);
 
-    /* ====== TODO: parsowanie konfiguracji z argv lub stdin ======
-     * Minimalnie: wpisac na sztywno poprawne wartości, żeby ruszyć.
-     * Docelowo: P>10, N, Tp/Tk, ceny, Ki.
-     */
-    int P = 12;
-    int N = 30;
-    int Tp = 0;     /* TODO: zrobic realny czas */
-    int Tk = 60;    /* TODO: zrobic realny czas / długość symulacji */
-    int prices[MAX_P];
+    /* Utwórz osobną grupę procesów dla symulacji (żeby kill(-pgid, ...) nie dotknął powłoki) */
+    CHECK_SYS(setpgid(0, 0), "setpgid(manager)");
+    g_pgid = getpgrp();
+
+
+    int P = 15;
+    int N = 9;
+    int Tp = 0;     
+    int Tk = 23;    
+    Product produkty[MAX_P];
     int Ki[MAX_P];
+    int spawned_clients_total = 0;
+    long long last_spawn_ms = 0;
+
+    /* Domyślna lista produktów (P=15) */
+    memset(produkty, 0, sizeof(produkty));
+    strcpy(produkty[0].nazwa, "Bułka kajzerka");             produkty[0].cena = 3.0;
+    strcpy(produkty[1].nazwa, "Bułka grahamka");            produkty[1].cena = 4.0;
+    strcpy(produkty[2].nazwa, "Chleb pszenny");             produkty[2].cena = 6.0;
+    strcpy(produkty[3].nazwa, "Chleb pełnoziarnisty");      produkty[3].cena = 7.0;
+    strcpy(produkty[4].nazwa, "Chleb żytni");               produkty[4].cena = 8.0;
+    strcpy(produkty[5].nazwa, "Bagietka");                  produkty[5].cena = 9.0;
+    strcpy(produkty[6].nazwa, "Chleb na zakwasie");         produkty[6].cena = 10.0;
+    strcpy(produkty[7].nazwa, "Pieczywo bezglutenowe");     produkty[7].cena = 11.0;
+    strcpy(produkty[8].nazwa, "Pączek");                    produkty[8].cena = 2.0;
+    strcpy(produkty[9].nazwa, "Rogalik");                   produkty[9].cena = 12.0;
+    strcpy(produkty[10].nazwa, "Ciastko kruche");           produkty[10].cena = 1.0;
+    strcpy(produkty[11].nazwa, "Strucla");                  produkty[11].cena = 13.0;
+    strcpy(produkty[12].nazwa, "Zapiekanka");               produkty[12].cena = 14.0;
+    strcpy(produkty[13].nazwa, "Focaccia");                 produkty[13].cena = 15.0;
+    strcpy(produkty[14].nazwa, "Rogal świętomarciński");    produkty[14].cena = 16.0;
 
     for (int i = 0; i < P; ++i) {
-        prices[i] = 5 + i;          /* TODO: wczytaj z wejścia */
-        Ki[i] = 10 + (i % 5);       /* TODO: wczytaj z wejścia */
+        Ki[i] = 10 + (i % 5);     
     }
 
-    if (!validate_config(P, N, Tp, Tk, Ki, prices)) {
+    if (!validate_config(P, N, Tp, Tk, Ki, produkty)) {
         fprintf(stderr, "Błędna konfiguracja. Sprawdź P>10, N>0, Tp<Tk, Ki/prices.\n");
         return EXIT_FAILURE;
     }
@@ -206,9 +247,16 @@ int main(int argc, char** argv) {
     st->open_hour = Tp;
     st->close_hour = Tk;
 
+    st->store_open = 1;
+    st->evacuated = 0;
+    st->inventory_mode = 0;
+    st->customers_in_store = 0;
+
     for (int i = 0; i < P; ++i) {
-        st->prices[i] = prices[i];
+        st->produkty[i] = produkty[i];
         st->Ki[i] = Ki[i];
+        st->produced[i] = 0;
+        st->wasted[i] = 0;
 
         st->conveyors[i].capacity = Ki[i];
         st->conveyors[i].head = 0;
@@ -216,7 +264,18 @@ int main(int argc, char** argv) {
         st->conveyors[i].count = 0;
         /* items[] zostaje 0 */
     }
+
+    for (int c = 0; c < CASHIERS; ++c) {
+        st->cashier_open[c] = 1;       /* albo 1 tylko dla kasy 0, jeśli chcesz min 1 na start */
+        st->cashier_accepting[c] = 1;  /* jw. */
+        st->cashier_queue_len[c] = 0;
+        for (int i = 0; i < P; ++i) st->sold_by_cashier[c][i] = 0;
+    }
     shm_unlock_or_die(h.sem_id);
+    LOGF("kierownik", "Start symulacji: P=%d, N=%d, godziny %d-%d", P, N, Tp, Tk);
+    LOGF("kierownik", "IPC: shm_id=%d, sem_id=%d, msg=[%d,%d,%d]",
+        h.shm_id, h.sem_id, h.msg_id[0], h.msg_id[1], h.msg_id[2]);
+    
 
     /* Ustawic semafory: store slots = N, empty[i]=Ki[i] */
     {
@@ -239,13 +298,13 @@ int main(int argc, char** argv) {
     /* ====== Uruchom procesy ====== */
     spawn_baker_or_die();
     spawn_cashiers_or_die();
+    LOGF("kierownik", "Uruchomiono piekarza i %d kasjerów", CASHIERS);
 
     /* Opcjonalny FIFO */
     int fifo_fd = ctrl_fifo_open_or_off();
 
     /* ====== Główna pętla symulacji ====== */
-    /* TODO: zastapic Tk na realny zegar (Tp..Tk), np. time(NULL) i progi czasu */
-    int sim_time = 0;
+    
 
     while (!g_sig_term) {
         /* Obsługa FIFO */
@@ -259,9 +318,13 @@ int main(int argc, char** argv) {
             shm_unlock_or_die(h.sem_id);
 
             /* Wyślij ewakuację do grupy procesów */
-            /* TODO: ustawic grupę procesów (setpgid) i zrobic kill(-pgid, SIG_EVAC) */
-            /* Na razie: wyślij do siebie (potem do wszystkich) */
-            kill(0, SIG_EVAC);
+            if (g_pgid > 0) {
+                LOGF("kierownik", "EWAKUACJA! Wysyłam sygnał do wszystkich procesów.");
+                CHECK_SYS(kill(-g_pgid, SIG_EVAC), "kill(-pgid, SIG_EVAC)");
+            } else {
+                LOGF("kierownik", "EWAKUACJA! Wysyłam sygnał do wszystkich procesów.");
+                CHECK_SYS(kill(0, SIG_EVAC), "kill(0, SIG_EVAC)");
+            }
 
             break;
         }
@@ -270,40 +333,83 @@ int main(int argc, char** argv) {
             shm_lock_or_die(h.sem_id);
             st->inventory_mode = 1;
             shm_unlock_or_die(h.sem_id);
+            LOGF("kierownik", "INWENTARYZACJA: tryb włączony (klienci kupują do zamknięcia).");
             g_sig_inv = 0;
+        }
+
+        int hour = current_hour_local();
+
+        if (hour < Tp) {
+        msleep(500);
+        continue;
+        }
+
+        if (hour >= Tk) {
+        shm_lock_or_die(h.sem_id);
+        st->store_open = 0;
+        shm_unlock_or_die(h.sem_id);
+        LOGF("kierownik", "Zamknięcie sklepu (godzina=%d >= %d).", hour, Tk);
+        break;
         }
 
         /* Polityka kas */
         apply_cashier_policy(st, h.sem_id);
 
         /* Generacja klientów */
-        /* TODO: dodac limit MAX_CLIENTS_TOTAL i walidację wejścia */
         int should_spawn = (rand_between(0, 100) < 35); /* ~35% iteracji */
         if (should_spawn) {
-            /* TODO: nie spawnuj po zamknięciu sklepu */
-            spawn_client_or_die();
+            long long t = now_ms();
+
+            /* rate limit */
+            if (t - last_spawn_ms < SPAWN_COOLDOWN_MS) {
+                /* za szybko – pomijamy */
+            } else if (spawned_clients_total >= MAX_CLIENTS_TOTAL) {
+                /* osiągnięto limit – pomijamy */
+            } else {
+                /* Nie spawnuj po zamknięciu sklepu (lub po ewakuacji) */
+                shm_lock_or_die(h.sem_id);
+                int open_now = (st->store_open && !st->evacuated);
+                shm_unlock_or_die(h.sem_id);
+
+                if (open_now) {
+                    spawn_client_or_die();
+                    LOGF("kierownik", "Nowy klient (łącznie: %d/%d)", spawned_clients_total, MAX_CLIENTS_TOTAL);
+                    spawned_clients_total++;
+                    last_spawn_ms = t;
+                }
+            }
         }
 
-        /* Koniec dnia (Tk) */
-        sim_time += 1;
-        if (sim_time >= Tk) {
-            shm_lock_or_die(h.sem_id);
-            st->store_open = 0; /* sygnał dla klientów: nie wchodzić nowym */
-            shm_unlock_or_die(h.sem_id);
-            break;
-        }
+        msleep(200); /* główna pętla co 200ms */
+    }
+    
+    
+        
 
+    /* ====== Faza zamykania ====== */
+    //TODO: inwentaryzacja
+    /* 1) Zamknij kasy dla nowych klientów (kasjerzy domkną kolejki) */
+    shm_lock_or_die(h.sem_id);
+    for (int i = 0; i < CASHIERS; ++i) {
+        st->cashier_accepting[i] = 0;
+        LOGF("kierownik", "Zamykanie kas dla nowych klientów (domykanie kolejek).");
+        /* st->cashier_open[i] zostawiamy bez zmian:
+           kasjer sam domknie kolejkę i (w Twojej wersji cashier.c) ustawi cashier_open=0 */
+    }
+    shm_unlock_or_die(h.sem_id);
+
+    while (1) {
+        shm_lock_or_die(h.sem_id);
+        int in_store = st->customers_in_store;
+        shm_unlock_or_die(h.sem_id);
+
+        if (in_store <= 0) break;
         msleep(200);
     }
 
-    /* ====== Faza zamykania ====== */
+    LOGF("kierownik", "Wszyscy klienci opuścili sklep.");
 
-    /* TODO: poczekac aż klienci wyjdą (customers_in_store==0) */
-    /* TODO: zamknac kasy poprawnie (cashier_accepting=0) */
-    /* TODO: inwentaryzacja: raporty kasjerów, sumy kierownika i piekarza */
-
-    /* Poczekaj na dzieci */
-    /* TODO: przechwycic konkretne PID-y i robić waitpid, tu tylko "sprzątanie ogólne" */
+    /* 3) Poczekaj na dzieci */
     int status;
     while (wait(&status) > 0) {
         /* TODO: log exit codes */
@@ -318,3 +424,5 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+
+        
