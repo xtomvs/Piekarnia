@@ -17,6 +17,7 @@ static void handler(int sig) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
     install_signal_handlers_or_die(handler);
@@ -41,18 +42,18 @@ int main(void) {
     ipc_attach_or_die(&h, &st);
 
     int P = 0;
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     P = st->P;
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
     LOGF("piekarz", "Start pracy. Liczba produktów: %d", P);
 
     while (!g_stop) {
         /* Sprawdź czy sklep otwarty */
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         int open = st->store_open;
         int evacuated = st->evacuated;
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
 
         if (!open || evacuated) break;
 
@@ -68,8 +69,8 @@ int main(void) {
             for (int k = 0; k < qty; ++k) {
                 if (g_stop) break;
                 /* Czekaj na miejsce na podajniku pid */
-                sem_P_or_die(h.sem_id, SEM_CONV_EMPTY(pid));
-                sem_P_or_die(h.sem_id, SEM_CONV_MUTEX(pid));
+                sem_P(h.sem_id, SEM_CONV_EMPTY(pid));
+                sem_P(h.sem_id, SEM_CONV_MUTEX(pid));
 
                 /* Sekcja krytyczna: dopisac na tail (FIFO) */
                 Conveyor* cv = &st->conveyors[pid];
@@ -78,8 +79,8 @@ int main(void) {
                 if (cv->capacity <= 0 || cv->capacity > MAX_KI) {
                     fprintf(stderr, "[baker] ERROR: invalid capacity=%d for product %d (MAX_KI=%d)\n", cv->capacity, pid, MAX_KI);
                     /* Cofnij zajęte miejsce i wyjdź bez zostawiania niespójności */
-                    sem_V_or_die(h.sem_id, SEM_CONV_MUTEX(pid));
-                    sem_V_or_die(h.sem_id, SEM_CONV_EMPTY(pid));
+                    sem_V(h.sem_id, SEM_CONV_MUTEX(pid));
+                    sem_V(h.sem_id, SEM_CONV_EMPTY(pid));
                     g_stop = 1;
                     break;
                 }
@@ -93,8 +94,8 @@ int main(void) {
                 st->produced[pid]++;
                 wyprodukowano[pid]++;
 
-                sem_V_or_die(h.sem_id, SEM_CONV_MUTEX(pid));
-                sem_V_or_die(h.sem_id, SEM_CONV_FULL(pid));
+                sem_V(h.sem_id, SEM_CONV_MUTEX(pid));
+                sem_V(h.sem_id, SEM_CONV_FULL(pid));
             }
         }
 

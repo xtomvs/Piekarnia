@@ -10,7 +10,7 @@
  */
 
 #define MAX_CLIENTS_TOTAL 50     
-#define SPAWN_COOLDOWN_MS 300    /* max 1 klient na 300ms */
+#define SPAWN_COOLDOWN_MS 150 /* max 1 klient na 300ms */
 
 /* Flagi ustawiane w handlerze sygnału */
 static volatile sig_atomic_t g_sig_evac = 0;
@@ -66,24 +66,19 @@ static void spawn_client_or_die(void) {
 
 static int desired_open_cashiers(const BakeryState* st) {
     /* Zasad: K = N/3, min 1, max 3, zależnie od liczby klientów w sklepie. */
-    int N = st->N;
-    int K = (N > 0) ? (N / 3) : 1;
-    if (K <= 0) K = 1;
-
     int c = st->customers_in_store;
-    int want = (c + K - 1) / K; /* ceil(c/K) */
-    if (want < 1) want = 1;
-    if (want > CASHIERS) want = CASHIERS;
+    int N = st->N;
 
-    /* gdy < 2N/3, jedna kasa ma być zamknięta */
-    if (c < (2 * N) / 3 && want == 3) want = 2;
+    int t1 = N / 3;        /* próg na 2 kasę */
+    int t2 = (2 * N) / 3;  /* próg na 3 kasę */
 
-
-    return want;
+    if (c > t2) return 3;
+    if (c > t1) return 2;
+    return 1;
 }
 
 static void apply_cashier_policy(BakeryState* st, int sem_id) {
-    shm_lock_or_die(sem_id);
+    shm_lock(sem_id);
 
     int want = desired_open_cashiers(st);
 
@@ -92,10 +87,6 @@ static void apply_cashier_policy(BakeryState* st, int sem_id) {
     for (int i = 0; i < CASHIERS; ++i) {
         if (st->cashier_open[i] && st->cashier_accepting[i]) open++;
     }
-
-    /* Zawsze minimum 1 kasa przyjmuje nowych */
-    if (want < 1) want = 1;
-    if (want > CASHIERS) want = CASHIERS;
 
     /* Otwieranie */
     for (int i = 0; i < CASHIERS && open < want; ++i) {
@@ -124,7 +115,7 @@ static void apply_cashier_policy(BakeryState* st, int sem_id) {
         }
     }
 
-    shm_unlock_or_die(sem_id);
+    shm_unlock(sem_id);
 }
 
 /* 
@@ -176,12 +167,33 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+static void reap_children_nonblocking(void) {
+    int status;
+    pid_t pid;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (WIFEXITED(status)) {
+            LOGF("kierownik", "Proces potomny pid=%d zakończył się kodem=%d",
+                 (int)pid, WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            LOGF("kierownik", "Proces potomny pid=%d zakończony sygnałem=%d",
+                 (int)pid, WTERMSIG(status));
+        } else {
+            LOGF("kierownik", "Proces potomny pid=%d zakończony (status=%d)",
+                 (int)pid, status);
+        }
+    }
+
+    /* waitpid == 0 -> brak zakończonych dzieci, waitpid == -1 -> np. brak dzieci (ECHILD) */
+}
+
 
 /* =========================
  *  Main
  * ========================= */
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     (void)argc; (void)argv;
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
@@ -195,8 +207,8 @@ int main(int argc, char** argv) {
 
     int P = 15;
     int N = 9;
-    int Tp = 0;     
-    int Tk = 23;    
+    int Tp = 6;     
+    int Tk = 20;    
     Product produkty[MAX_P];
     int Ki[MAX_P];
     int spawned_clients_total = 0;
@@ -241,7 +253,7 @@ int main(int argc, char** argv) {
     ipc_attach_or_die(&h, &st);
 
     /* Ustawic konfigurację w SHM */
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     st->P = P;
     st->N = N;
     st->open_hour = Tp;
@@ -271,7 +283,7 @@ int main(int argc, char** argv) {
         st->cashier_queue_len[c] = 0;
         for (int i = 0; i < P; ++i) st->sold_by_cashier[c][i] = 0;
     }
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
     LOGF("kierownik", "Start symulacji: P=%d, N=%d, godziny %d-%d", P, N, Tp, Tk);
     LOGF("kierownik", "IPC: shm_id=%d, sem_id=%d, msg=[%d,%d,%d]",
         h.shm_id, h.sem_id, h.msg_id[0], h.msg_id[1], h.msg_id[2]);
@@ -310,12 +322,14 @@ int main(int argc, char** argv) {
         /* Obsługa FIFO */
         ctrl_fifo_poll(fifo_fd);
 
+        reap_children_nonblocking();
+
         /* Obsługa sygnałów */
         if (g_sig_evac) {
-            shm_lock_or_die(h.sem_id);
+            shm_lock(h.sem_id);
             st->evacuated = 1;
             st->store_open = 0;
-            shm_unlock_or_die(h.sem_id);
+            shm_unlock(h.sem_id);
 
             /* Wyślij ewakuację do grupy procesów */
             if (g_pgid > 0) {
@@ -330,9 +344,9 @@ int main(int argc, char** argv) {
         }
 
         if (g_sig_inv) {
-            shm_lock_or_die(h.sem_id);
+            shm_lock(h.sem_id);
             st->inventory_mode = 1;
-            shm_unlock_or_die(h.sem_id);
+            shm_unlock(h.sem_id);
             LOGF("kierownik", "INWENTARYZACJA: tryb włączony (klienci kupują do zamknięcia).");
             g_sig_inv = 0;
         }
@@ -345,9 +359,9 @@ int main(int argc, char** argv) {
         }
 
         if (hour >= Tk) {
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         st->store_open = 0;
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
         LOGF("kierownik", "Zamknięcie sklepu (godzina=%d >= %d).", hour, Tk);
         break;
         }
@@ -367,9 +381,9 @@ int main(int argc, char** argv) {
                 /* osiągnięto limit – pomijamy */
             } else {
                 /* Nie spawnuj po zamknięciu sklepu (lub po ewakuacji) */
-                shm_lock_or_die(h.sem_id);
+                shm_lock(h.sem_id);
                 int open_now = (st->store_open && !st->evacuated);
-                shm_unlock_or_die(h.sem_id);
+                shm_unlock(h.sem_id);
 
                 if (open_now) {
                     spawn_client_or_die();
@@ -389,19 +403,19 @@ int main(int argc, char** argv) {
     /* ====== Faza zamykania ====== */
     //TODO: inwentaryzacja
     /* 1) Zamknij kasy dla nowych klientów (kasjerzy domkną kolejki) */
-    shm_lock_or_die(h.sem_id);
+    LOGF("kierownik", "Zamykanie kas dla nowych klientów (domykanie kolejek).");
+    shm_lock(h.sem_id);
     for (int i = 0; i < CASHIERS; ++i) {
         st->cashier_accepting[i] = 0;
-        LOGF("kierownik", "Zamykanie kas dla nowych klientów (domykanie kolejek).");
         /* st->cashier_open[i] zostawiamy bez zmian:
            kasjer sam domknie kolejkę i (w Twojej wersji cashier.c) ustawi cashier_open=0 */
     }
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
     while (1) {
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         int in_store = st->customers_in_store;
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
 
         if (in_store <= 0) break;
         msleep(200);

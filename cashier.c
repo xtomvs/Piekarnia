@@ -33,7 +33,10 @@ static void print_summary(const BakeryState* st, int cashier_id) {
 
 static void process_sale(BakeryState* st, int sem_id, int cashier_id, const ClientMsg* msg) {
     /* Księgowanie zakupów kasjera (sztuki per produkt) */
-    shm_lock_or_die(sem_id);
+    fprintf(stdout,
+        "[kasjer pid=%d] KASUJĘ: klient_pid=%d, pozycji=%d (kasa=%d)\n",
+        (int)getpid(), (int)msg->client_pid, msg->item_count, cashier_id);
+    shm_lock(sem_id);
     for (int i = 0; i < msg->item_count; ++i) {
         int pid = msg->items[i].product_id;
         int qty = msg->items[i].quantity;
@@ -42,12 +45,13 @@ static void process_sale(BakeryState* st, int sem_id, int cashier_id, const Clie
         }
         /* TODO: pełna walidacja komunikatu (item_count range, qty range) */
     }
-    shm_unlock_or_die(sem_id);
+    shm_unlock(sem_id);
 
     /* TODO: "wydruk paragonu" z nazwami i cenami: st->produkty[pid].nazwa, st->produkty[pid].cena */
 }
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
         fprintf(stderr, "Użycie: cashier <id 0..2>\n");
         return EXIT_FAILURE;
@@ -82,15 +86,29 @@ int main(int argc, char** argv) {
 
     LOGF("kasjer", "Start pracy. Stanowisko: %d", cashier_id);
 
+    int prev_store_open = -1, prev_opened = -1, prev_accepting = -1, prev_evacuated = -1;
+    int said_not_accepting = 0;
+
     while (!g_stop) {
         /* Czy sklep nadal działa? */
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         int store_open = st->store_open;
         int accepting = st->cashier_accepting[cashier_id];
         int opened = st->cashier_open[cashier_id];
         int evacuated = st->evacuated;
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
+        if (store_open != prev_store_open || opened != prev_opened ||
+            accepting != prev_accepting || evacuated != prev_evacuated) {
 
+            LOGF("kasjer",
+                "Stan: store_open=%d opened=%d accepting=%d evacuated=%d (kasa=%d)",
+                store_open, opened, accepting, evacuated, cashier_id);
+
+            prev_store_open = store_open;
+            prev_opened     = opened;
+            prev_accepting  = accepting;
+            prev_evacuated  = evacuated;
+        }
         if (evacuated) break;
 
         /* Zamknięcie sklepu: dokończ kolejkę i wyjdź */
@@ -105,23 +123,30 @@ int main(int argc, char** argv) {
                     perror("msgrcv (drain on store close)");
                     break;
                 }
+                
                 if (g_evac) {
                     /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
-                    shm_lock_or_die(h.sem_id);
+                    shm_lock(h.sem_id);
                     if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
-                    shm_unlock_or_die(h.sem_id);
+                    shm_unlock(h.sem_id);
                     break;
                 }
                 LOGF("kasjer", "Obsługuję klienta pid=%d (pozycji: %d)", (int)msg.client_pid, msg.item_count);
                 for (int i = 0; i < msg.item_count; ++i) {
                     int pid = msg.items[i].product_id;
                     int qty = msg.items[i].quantity;
-                    LOGF("kasjer", "  - %s x%d", st->produkty[pid].nazwa, qty);
+                    if (pid >= 0 && pid < st->P && qty > 0) {
+                        LOGF("kasjer", "  - %s x%d", st->produkty[pid].nazwa, qty);
+                    } else {
+                        LOGF("kasjer", "  - (BŁĘDNY PRODUKT pid=%d, qty=%d)", pid, qty);
+                    }
                 }
                 process_sale(st, h.sem_id, cashier_id, &msg);
-                shm_lock_or_die(h.sem_id);
+                LOGF("kasjer", "Zakończyłem obsługę klienta pid=%d (kasa=%d)",
+                    (int)msg.client_pid, cashier_id);
+                shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
-                shm_unlock_or_die(h.sem_id);
+                shm_unlock(h.sem_id);
             }
             break;
         }
@@ -136,7 +161,10 @@ int main(int argc, char** argv) {
 
         if (!accepting) {
             /* Domknięcie kolejki po zamknięciu dla nowych */
-             LOGF("kasjer", "Kasa %d nie przyjmuje nowych – kończę obsługę kolejki.", cashier_id);
+            if (!said_not_accepting) {
+                LOGF("kasjer", "Kasa %d nie przyjmuje nowych – domykam kolejkę.", cashier_id);
+                said_not_accepting = 1;
+            }
             int processed_any = 0;
             while (1) {
                 ClientMsg msg;
@@ -150,26 +178,31 @@ int main(int argc, char** argv) {
                 processed_any = 1;
                 if (g_evac) {
                     /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
-                    shm_lock_or_die(h.sem_id);
+                    shm_lock(h.sem_id);
                     if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
-                    shm_unlock_or_die(h.sem_id);
+                    shm_unlock(h.sem_id);
                     break;
                 }
                 process_sale(st, h.sem_id, cashier_id, &msg);
-                shm_lock_or_die(h.sem_id);
+                shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
-                shm_unlock_or_die(h.sem_id);
+                shm_unlock(h.sem_id);
             }
 
             /* Jeżeli kolejka pusta -> fizycznie zamknij kasę (proces dalej działa i może być ponownie otwarty) */
-            shm_lock_or_die(h.sem_id);
+            shm_lock(h.sem_id);
             if (st->store_open && !st->cashier_accepting[cashier_id]) {
-                st->cashier_open[cashier_id] = 0;
+                if (st->cashier_queue_len[cashier_id] == 0) {
+                    st->cashier_open[cashier_id] = 0;
+                    LOGF("kasjer", "Kasa %d: kolejka pusta -> zamykam fizycznie.", cashier_id);
+                }
             }
-            shm_unlock_or_die(h.sem_id);
+            shm_unlock(h.sem_id);
 
             if (!processed_any) msleep(100);
             continue;
+        } else {
+            said_not_accepting = 0;
         }
 
         ClientMsg msg;
@@ -182,27 +215,27 @@ int main(int argc, char** argv) {
 
         if (g_evac) {
             /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
-            shm_lock_or_die(h.sem_id);
+            shm_lock(h.sem_id);
             if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
-            shm_unlock_or_die(h.sem_id);
+            shm_unlock(h.sem_id);
             break;
         }
 
         process_sale(st, h.sem_id, cashier_id, &msg);
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
     }
 
     /* Inwentaryzacja: jeśli inventory_mode, wypisac podsumowanie */
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     int inv = st->inventory_mode;
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
     if (inv && !g_evac) {
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         print_summary(st, cashier_id);
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
     }
 
     if (g_evac) LOGF("kasjer", "Kończę pracę (ewakuacja).");

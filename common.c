@@ -117,6 +117,7 @@ void ipc_detach_or_die(BakeryState* state) {
 }
 
 void ipc_destroy_or_die(const IpcHandles* h, int P) {
+    (void)P; 
     if (!h) return;
 
     /* Kolejki */
@@ -144,16 +145,19 @@ void ipc_destroy_or_die(const IpcHandles* h, int P) {
  *  Semafory: P/V
  * ========================= */
 
-static void semop_or_die(int sem_id, unsigned short sem_num, short delta, int flags) {
+static int semop_or_die(int sem_id, unsigned short sem_num, short delta, int flags) {
     struct sembuf op;
     op.sem_num = sem_num;
     op.sem_op  = delta;
     op.sem_flg = (short)flags;
 
-    if (semop(sem_id, &op, 1) == -1) DIE_PERROR("semop");
+    while (semop(sem_id, &op, 1) == -1) {
+        if (errno == EINTR) continue;   /* przerwane sygnałem -> ponów */
+        DIE_PERROR("semop");
+    }
 }
 
-void sem_P_or_die(int sem_id, int sem_num) {
+void sem_P(int sem_id, int sem_num) {
     semop_or_die(sem_id, (unsigned short)sem_num, -1, 0);
 }
 
@@ -164,21 +168,21 @@ int sem_P_nowait(int sem_id, int sem_num) {
     op.sem_flg = IPC_NOWAIT;
 
     if (semop(sem_id, &op, 1) == -1) {
-        /* errno np. EAGAIN */
+        if (errno == EINTR) return -1;
         return -1;
     }
     return 0;
 }
 
-void sem_V_or_die(int sem_id, int sem_num) {
+void sem_V(int sem_id, int sem_num) {
     semop_or_die(sem_id, (unsigned short)sem_num, +1, 0);
 }
 
-void shm_lock_or_die(int sem_id) {
-    sem_P_or_die(sem_id, SEM_SHM_GLOBAL);
+void shm_lock(int sem_id) {
+    return sem_P(sem_id, SEM_SHM_GLOBAL);
 }
-void shm_unlock_or_die(int sem_id) {
-    sem_V_or_die(sem_id, SEM_SHM_GLOBAL);
+void shm_unlock(int sem_id) {
+    return sem_V(sem_id, SEM_SHM_GLOBAL);
 }
 
 /* =========================

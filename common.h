@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 /* =========================
  *  Konfiguracja projektu
@@ -72,9 +73,10 @@
     }                                              \
 } while (0)
 
-#define LOGF(rola, fmt, ...) do { \
-    fprintf(stdout, "[%s pid=%d] " fmt "\n", rola, (int)getpid(), ##__VA_ARGS__); \
-    fflush(stdout); \
+#define LOGF(tag, ...) do { \
+    fprintf(stdout, "[%s pid=%d] ", (tag), (int)getpid()); \
+    fprintf(stdout, __VA_ARGS__); \
+    fprintf(stdout, "\n"); \
 } while (0)
 /* =========================
  *  Struktury danych w SHM
@@ -205,13 +207,13 @@ void ipc_detach_or_die(BakeryState* state);
 void ipc_destroy_or_die(const IpcHandles* h, int P);
 
 /* Semafory: operacje P/V + nowait */
-void sem_P_or_die(int sem_id, int sem_num);
+void sem_P(int sem_id, int sem_num);
 int  sem_P_nowait(int sem_id, int sem_num); /* 0=ok, -1=błąd (errno ustawione) */
-void sem_V_or_die(int sem_id, int sem_num);
+void sem_V(int sem_id, int sem_num);
 
 /* Mutex dla SHM globalnej */
-void shm_lock_or_die(int sem_id);
-void shm_unlock_or_die(int sem_id);
+void shm_lock(int sem_id);
+void shm_unlock(int sem_id);
 
 /* Losowanie */
 int rand_between(int a, int b);

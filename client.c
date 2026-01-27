@@ -41,7 +41,20 @@ static int choose_cashier(const BakeryState* st) {
             }
         }
     }
-    if (best != -1) return best;
+    
+    if (best != -1) {
+        /* 2) jeśli kolejka > 2, spróbuj inną kasę accepting z kolejką <=2 */
+        if (best_len > 2) {
+            for (int i = 0; i < CASHIERS; ++i) {
+                if (i == best) continue;
+                if (st->cashier_open[i] && st->cashier_accepting[i]) {
+                    int len = st->cashier_queue_len[i];
+                    if (len <= 2) return i;
+                }
+            }
+        }
+        return best;
+    }
 
     for (int i = 0; i < CASHIERS; ++i) {
         if (st->cashier_open[i]) return i;
@@ -50,6 +63,7 @@ static int choose_cashier(const BakeryState* st) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     install_signal_handlers_or_die(handler);
 
@@ -73,10 +87,10 @@ int main(void) {
     ipc_attach_or_die(&h, &st);
 
     /* Czy sklep jeszcze otwarty? */
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     int open = st->store_open;
     int P = st->P;
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
     if (!open) {
         ipc_detach_or_die(st);
@@ -84,13 +98,13 @@ int main(void) {
     }
 
     /* Wejście do sklepu (limit N) */
-    sem_P_or_die(h.sem_id, SEM_STORE_SLOTS);
+    sem_P(h.sem_id, SEM_STORE_SLOTS);
 
     /* Zwiększ customers_in_store */
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     st->customers_in_store++;
     LOGF("klient", "Wchodzę do sklepu (klientów w sklepie: %d)", st->customers_in_store);
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
     /* czas wejścia/rozejrzenia się */
     msleep(rand_between(80, 250));
@@ -135,7 +149,7 @@ int main(void) {
                 }
             }
 
-            sem_P_or_die(h.sem_id, SEM_CONV_MUTEX(pid));
+            sem_P(h.sem_id, SEM_CONV_MUTEX(pid));
 
             /* Zdejmij z head (FIFO) */
             Conveyor* cv = &st->conveyors[pid];
@@ -144,8 +158,8 @@ int main(void) {
             if (cv->capacity <= 0 || cv->capacity > MAX_KI) {
                 fprintf(stderr, "[client %d] ERROR: invalid capacity=%d for product %d (MAX_KI=%d)\n", (int)getpid(), cv->capacity, pid, MAX_KI);
                 /* Cofnij pobranie z FULL (bo nie zdejmujemy faktycznie towaru) */
-                sem_V_or_die(h.sem_id, SEM_CONV_MUTEX(pid));
-                sem_V_or_die(h.sem_id, SEM_CONV_FULL(pid));
+                sem_V(h.sem_id, SEM_CONV_MUTEX(pid));
+                sem_V(h.sem_id, SEM_CONV_FULL(pid));
                 g_stop = 1;
                 break;
             }
@@ -167,11 +181,11 @@ int main(void) {
                 removed = 0;
             }
 
-            sem_V_or_die(h.sem_id, SEM_CONV_MUTEX(pid));
+            sem_V(h.sem_id, SEM_CONV_MUTEX(pid));
             if (removed) {
-                sem_V_or_die(h.sem_id, SEM_CONV_EMPTY(pid));
+                sem_V(h.sem_id, SEM_CONV_EMPTY(pid));
             } else {
-                sem_V_or_die(h.sem_id, SEM_CONV_FULL(pid));
+                sem_V(h.sem_id, SEM_CONV_FULL(pid));
             }
             
         }
@@ -186,20 +200,20 @@ int main(void) {
     /* Ewakuacja: odkładamy do kosza i wychodzimy */
     if (g_evac) {
         LOGF("klient", "EWAKUACJA! Odkładam towar do kosza i wychodzę.");
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id); 
         LOGF("klient", "Zakończono zakupy, liczba pozycji w koszyku: %d", msg.item_count);
         for (int i = 0; i < msg.item_count; ++i) {
             int pid = msg.items[i].product_id;
             int qty = msg.items[i].quantity;
             if (pid >= 0 && pid < st->P && qty > 0) st->wasted[pid] += qty;
         }
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
 
         /* Wyjście */
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         st->customers_in_store--;
-        shm_unlock_or_die(h.sem_id);
-        sem_V_or_die(h.sem_id, SEM_STORE_SLOTS);
+        shm_unlock(h.sem_id);
+        sem_V(h.sem_id, SEM_STORE_SLOTS);
 
         ipc_detach_or_die(st);
         return 0;
@@ -207,26 +221,27 @@ int main(void) {
 
     /* Wybierz kasę i wyślij koszyk */
     int cashier = 0;
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     cashier = choose_cashier(st);
-    LOGF("klient", "Wybrałem kasę %d (długość kolejki: %d)", cashier, st->cashier_queue_len[cashier]);
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
     /* Jeśli koszyk pusty, klient może iść prosto do wyjścia */
     if (msg.item_count > 0) {
         /* zanim wyśle, upewnij się że kasa nadal przyjmuje */
-        shm_lock_or_die(h.sem_id);
+        shm_lock(h.sem_id);
         int ok = st->cashier_open[cashier] && st->cashier_accepting[cashier] && !st->evacuated && st->store_open;
         if (ok) st->cashier_queue_len[cashier]++;  /* klient "staje w kolejce" */
-        shm_unlock_or_die(h.sem_id);
+        shm_unlock(h.sem_id);
 
         if (ok) {
+            fprintf(stdout, "[klient pid=%d] Wysyłam koszyk do kasy %d, item_count=%d\n",
+                (int)getpid(), cashier, msg.item_count);
             if (msgsnd(h.msg_id[cashier], &msg, sizeof(ClientMsg) - sizeof(long), 0) == -1) {
                 perror("msgsnd(client)");
                 /* cofnij licznik kolejki jeśli się nie udało */
-                shm_lock_or_die(h.sem_id);
+                shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier] > 0) st->cashier_queue_len[cashier]--;
-                shm_unlock_or_die(h.sem_id);
+                shm_unlock(h.sem_id);
                 /* TODO: ewentualnie spróbować inną kasę */
             } else {
                 LOGF("klient", "Wybrałem kasę %d (długość kolejki: %d)", cashier, st->cashier_queue_len[cashier]);
@@ -237,11 +252,11 @@ int main(void) {
     msleep(rand_between(50, 250));
 
     /* Wyjście */
-    shm_lock_or_die(h.sem_id);
+    shm_lock(h.sem_id);
     st->customers_in_store--;
-    shm_unlock_or_die(h.sem_id);
+    shm_unlock(h.sem_id);
 
-    sem_V_or_die(h.sem_id, SEM_STORE_SLOTS);
+    sem_V(h.sem_id, SEM_STORE_SLOTS);
 
     ipc_detach_or_die(st);
     LOGF("klient", "Wychodzę ze sklepu.");
