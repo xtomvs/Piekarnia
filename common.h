@@ -36,17 +36,17 @@
 #define IPC_KEY_FILE        "./.bakery_ipc_key"   /* Tworzony przez bakery, używany do ftok() */
 #define CTRL_FIFO_PATH      "./bakery_ctrl.fifo"  /* Opcjonalny kanał sterowania */
 
-/* Minimalne prawa dostępu  */
+/* Minimalne prawa dostępu*/
 #define IPC_PERMS_MIN       0600
 #define FIFO_PERMS_MIN      0600
 
-/* Ograniczenia statyczne (dla wersji wstępnej). */
+/* Ograniczenia statyczne*/
 #define MAX_P               15      
 #define MAX_KI              64     
 
 #define CASHIERS            3
 
-/* Sygnały używane w projekcie */
+/* Sygnały*/
 #define SIG_EVAC            SIGUSR1
 #define SIG_INV             SIGUSR2
 
@@ -92,14 +92,13 @@ typedef struct Conveyor {
 } Conveyor;
 
 typedef struct Product {
-    char nazwa[64];            /* nazwa produktu (UTF-8) */
+    char nazwa[64];            /* nazwa produktu */
     double cena;              /* cena produktu */
 } Product;
 
 /* Konfiguracja i stan globalny */
 typedef struct BakeryState {
-    /* Konfiguracja */
-    int P;                        /* liczba produktów (P>10) */
+    int P;                        /* liczba produktów*/
     int N;                        /* max klientów w sklepie */
     int open_hour;                /* Tp */
     int close_hour;               /* Tk */

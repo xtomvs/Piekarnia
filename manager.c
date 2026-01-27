@@ -66,15 +66,29 @@ static void spawn_client_or_die(void) {
 
 static int desired_open_cashiers(const BakeryState* st) {
     /* Zasad: K = N/3, min 1, max 3, zależnie od liczby klientów w sklepie. */
+    static int last = 1;          /* pamięta poprzednią decyzję */
     int c = st->customers_in_store;
     int N = st->N;
 
-    int t1 = N / 3;        /* próg na 2 kasę */
-    int t2 = (2 * N) / 3;  /* próg na 3 kasę */
+    int t1_on  = (N / 3) + 1;         /* np. 4 */
+    int t1_off = (N / 3) - 1;         /* np. 2 */
+    int t2_on  = (2 * N / 3) + 1;     /* np. 7 */
+    int t2_off = (2 * N / 3) - 1;     /* np. 5 */
 
-    if (c > t2) return 3;
-    if (c > t1) return 2;
-    return 1;
+    if (t1_off < 0) t1_off = 0;
+    if (t2_off < 0) t2_off = 0;
+
+    if (last == 1) {
+        if (c >= t2_on) last = 3;
+        else if (c >= t1_on) last = 2;
+    } else if (last == 2) {
+        if (c >= t2_on) last = 3;
+        else if (c <= t1_off) last = 1;
+    } else { /* last == 3 */
+        if (c <= t2_off) last = 2;
+    }
+
+    return last;
 }
 
 static void apply_cashier_policy(BakeryState* st, int sem_id) {
@@ -82,37 +96,24 @@ static void apply_cashier_policy(BakeryState* st, int sem_id) {
 
     int want = desired_open_cashiers(st);
 
-    /* policzyc aktualnie otwarte */
-    int open = 0;
-    for (int i = 0; i < CASHIERS; ++i) {
-        if (st->cashier_open[i] && st->cashier_accepting[i]) open++;
+    /* procesy kasjerów istnieją cały czas -> open=1 */
+    for (int i = 0; i < CASHIERS; ++i) st->cashier_open[i] = 1;
+
+    int a0 = 1;
+    int a1 = (want >= 2);
+    int a2 = (want >= 3);
+
+    if (st->cashier_accepting[0] != a0) {
+        st->cashier_accepting[0] = a0;
+        LOGF("kierownik", "Kasa 0 accepting=%d", a0);
     }
-
-    /* Otwieranie */
-    for (int i = 0; i < CASHIERS && open < want; ++i) {
-        if (!st->cashier_open[i]) {
-            st->cashier_open[i] = 1;
-            st->cashier_accepting[i] = 1;
-            open++;
-            LOGF("kierownik", "Otwarto kasę %d (przyjmuje nowych)", i);
-        } else if (!st->cashier_accepting[i]) {
-            st->cashier_accepting[i] = 1;
-            open++;
-            LOGF("kierownik", "Kasa %d znów przyjmuje nowych", i);
-        }
+    if (st->cashier_accepting[1] != a1) {
+        st->cashier_accepting[1] = a1;
+        LOGF("kierownik", "Kasa 1 accepting=%d", a1);
     }
-
-    /* Zamykanie dla nowych – od końca (2->1->0).
-     * Nie zamykamy ostatniej kasy (min. 1).
-     */
-    for (int i = CASHIERS - 1; i >= 0 && open > want; --i) {
-        if (st->cashier_open[i] && st->cashier_accepting[i]) {
-            if (open <= 1) break;
-            st->cashier_accepting[i] = 0; /* domknięcie kolejki: kasjer obsłuży obecnych w MQ */
-            open--;
-            LOGF("kierownik", "Kasa %d przestaje przyjmować nowych (domykanie kolejki)", i);
-
-        }
+    if (st->cashier_accepting[2] != a2) {
+        st->cashier_accepting[2] = a2;
+        LOGF("kierownik", "Kasa 2 accepting=%d", a2);
     }
 
     shm_unlock(sem_id);
@@ -213,6 +214,7 @@ int main(int argc, char** argv) {
     int Ki[MAX_P];
     int spawned_clients_total = 0;
     long long last_spawn_ms = 0;
+    long long last_policy_ms = 0;
 
     /* Domyślna lista produktów (P=15) */
     memset(produkty, 0, sizeof(produkty));
@@ -367,7 +369,11 @@ int main(int argc, char** argv) {
         }
 
         /* Polityka kas */
-        apply_cashier_policy(st, h.sem_id);
+        long long tnow = now_ms();
+        if (tnow - last_policy_ms >= 500) {
+            apply_cashier_policy(st, h.sem_id);
+            last_policy_ms = tnow;
+        }
 
         /* Generacja klientów */
         int should_spawn = (rand_between(0, 100) < 35); /* ~35% iteracji */

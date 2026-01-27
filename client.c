@@ -62,6 +62,33 @@ static int choose_cashier(const BakeryState* st) {
     return 0;
 }
 
+static void wait_before_store(int sem_id) {
+    int said_waiting = 0;
+
+    for (;;) {
+        if (sem_P_nowait(sem_id, SEM_STORE_SLOTS) == 0) {
+            if (said_waiting) {
+                LOGF("klient", "Wchodzę do sklepu (zwolniło się miejsce).");
+            }
+            return; /* mamy “slot” w sklepie */
+        }
+
+        if (errno == EAGAIN) {
+            if (!said_waiting) {
+                LOGF("klient", "Czekam przed sklepem – brak wolnych miejsc.");
+                said_waiting = 1;
+            }
+            msleep(200);
+            continue;
+        }
+
+        if (errno == EINTR) continue;
+
+        DIE_PERROR("sem_P_nowait(SEM_STORE_SLOTS)");
+    }
+}
+
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
@@ -98,7 +125,7 @@ int main(void) {
     }
 
     /* Wejście do sklepu (limit N) */
-    sem_P(h.sem_id, SEM_STORE_SLOTS);
+    wait_before_store(h.sem_id);
 
     /* Zwiększ customers_in_store */
     shm_lock(h.sem_id);
@@ -107,7 +134,7 @@ int main(void) {
     shm_unlock(h.sem_id);
 
     /* czas wejścia/rozejrzenia się */
-    msleep(rand_between(80, 250));
+    msleep(rand_between(300, 800));
 
     /* Losowa lista zakupów: min 2 różne produkty, dołóż dodatkowe z pewnym prawdopodobieństwem */
     int want_count = 2 + (rand_between(0, 100) < 40 ? 1 : 0); /* 2 lub 3 */
@@ -123,7 +150,7 @@ int main(void) {
 
     for (int i = 0; i < want_count; ++i) {
         /* poruszanie się po sklepie między podajnikami */
-        msleep(rand_between(120, 400));
+        msleep(rand_between(300, 800));
         if (g_stop) break;
         int pid;
         do { pid = rand_between(0, P - 1); } while (used[pid]);
@@ -135,7 +162,7 @@ int main(void) {
         int bought = 0;
         for (int k = 0; k < qty; ++k) {
             /* czas na znalezienie produktu / sięgnięcie po kolejną sztukę */
-            msleep(rand_between(20, 80));
+            msleep(rand_between(300, 800));
             if (g_evac || g_stop) break;
 
             /* sprobwowac nowait na FULL */

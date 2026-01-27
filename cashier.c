@@ -47,6 +47,7 @@ static void process_sale(BakeryState* st, int sem_id, int cashier_id, const Clie
     }
     shm_unlock(sem_id);
 
+    msleep(rand_between(500, 800));
     /* TODO: "wydruk paragonu" z nazwami i cenami: st->produkty[pid].nazwa, st->produkty[pid].cena */
 }
 
@@ -189,15 +190,15 @@ int main(int argc, char** argv) {
                 shm_unlock(h.sem_id);
             }
 
-            /* Jeżeli kolejka pusta -> fizycznie zamknij kasę (proces dalej działa i może być ponownie otwarty) */
+            /* Jeżeli kolejka pusta -> po prostu czekaj na ponowne accepting=1 (manager) */
             shm_lock(h.sem_id);
-            if (st->store_open && !st->cashier_accepting[cashier_id]) {
-                if (st->cashier_queue_len[cashier_id] == 0) {
-                    st->cashier_open[cashier_id] = 0;
-                    LOGF("kasjer", "Kasa %d: kolejka pusta -> zamykam fizycznie.", cashier_id);
-                }
-            }
+            int q = st->cashier_queue_len[cashier_id];
             shm_unlock(h.sem_id);
+
+            if (q == 0) {
+                /* nic nie rób, nie zamykaj cashier_open — tylko manager steruje */
+                msleep(100);
+            }
 
             if (!processed_any) msleep(100);
             continue;
