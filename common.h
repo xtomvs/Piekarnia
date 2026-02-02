@@ -2,7 +2,7 @@
 #define BAKERY_COMMON_H
 
 /*
- * Wspólne definicje dla: bakery (kierownik), baker (piekarz), cashier (kasjer), client (klient).
+ * Wspólne definicje dla: manager (kierownik), baker (piekarz), cashier (kasjer), client (klient).
  *
  */
 
@@ -112,6 +112,7 @@ typedef struct BakeryState {
     int evacuated;                /* 1 po SIG_EVAC */
 
     int customers_in_store;       /* aktualna liczba klientów */
+    int waiting_before_store;     /* liczba klientów czekających przed sklepem */
 
     int cashier_open[CASHIERS];       /* czy kasa jest otwarta */
     int cashier_accepting[CASHIERS];  /* czy kasa przyjmuje nowych (zamykanie = 0) */

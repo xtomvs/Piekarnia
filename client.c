@@ -73,6 +73,7 @@ static void wait_before_store(int sem_id) {
             return; /* mamy “slot” w sklepie */
         }
 
+<<<<<<< Updated upstream
         if (errno == EAGAIN) {
             if (!said_waiting) {
                 LOGF("klient", "Czekam przed sklepem – brak wolnych miejsc.");
@@ -85,6 +86,39 @@ static void wait_before_store(int sem_id) {
         if (errno == EINTR) continue;
 
         DIE_PERROR("sem_P_nowait(SEM_STORE_SLOTS)");
+=======
+static int wait_before_store(int sem_id, BakeryState* st) {
+    /* Najpierw sprawdz czy jest sens czekac */
+    int current_val = semctl(sem_id, SEM_STORE_SLOTS, GETVAL);
+    
+    if (current_val == 0) {
+        /* Zwiększ licznik czekających */
+        __sync_fetch_and_add(&st->waiting_before_store, 1);
+        int waiting = st->waiting_before_store;
+        LOGF("klient", "Czekam przed sklepem - brak wolnych miejsc (w sklepie: %d/%d, w kolejce: %d).", 
+             st->N, st->N, waiting);
+        
+        /* Blokujace oczekiwanie na semafor - przerywane przez sygnaly */
+        if (sem_P_interruptible(sem_id, SEM_STORE_SLOTS) == -1) {
+            __sync_fetch_and_sub(&st->waiting_before_store, 1);
+            if (g_stop || g_evac) {
+                LOGF("klient", "Przerywam oczekiwanie przed sklepem (sygnal).");
+                return -1;
+            }
+            return -1;
+        }
+        /* Zmniejsz licznik po wejściu */
+        __sync_fetch_and_sub(&st->waiting_before_store, 1);
+    } else {
+        /* Blokujace oczekiwanie na semafor - przerywane przez sygnaly */
+        if (sem_P_interruptible(sem_id, SEM_STORE_SLOTS) == -1) {
+            if (g_stop || g_evac) {
+                LOGF("klient", "Przerywam oczekiwanie przed sklepem (sygnal).");
+                return -1;
+            }
+            return -1;
+        }
+>>>>>>> Stashed changes
     }
 }
 
@@ -133,8 +167,14 @@ int main(void) {
     LOGF("klient", "Wchodzę do sklepu (klientów w sklepie: %d)", st->customers_in_store);
     shm_unlock(h.sem_id);
 
+<<<<<<< Updated upstream
     /* czas wejścia/rozejrzenia się */
     msleep(rand_between(300, 800));
+=======
+    /* czas wejscia/rozejrzenia sie */
+    LOGF("klient", "Rozgladam sie po sklepie...");
+    msleep(rand_between(500, 1000));
+>>>>>>> Stashed changes
 
     /* Losowa lista zakupów: min 2 różne produkty, dołóż dodatkowe z pewnym prawdopodobieństwem */
     int want_count = 2 + (rand_between(0, 100) < 40 ? 1 : 0); /* 2 lub 3 */
@@ -271,7 +311,47 @@ int main(void) {
                 shm_unlock(h.sem_id);
                 /* TODO: ewentualnie spróbować inną kasę */
             } else {
+<<<<<<< Updated upstream
                 LOGF("klient", "Wybrałem kasę %d (długość kolejki: %d)", cashier, st->cashier_queue_len[cashier]);
+=======
+                LOGF("klient", "Wybralem kase %d (dlugosc kolejki: %d), czekam na kasowanie...", cashier, st->cashier_queue_len[cashier]);
+                sent_to_cashier = 1;
+            }
+        } else {
+            LOGF("klient", "Sklep zamkniety - nie moge wyslac koszyka (%d produktow)", msg.item_count);
+        }
+    } else {
+        LOGF("klient", "Koszyk pusty - nie znalazlem zadnych produktow");
+    }
+
+    /* Czekaj na odpowiedz od kasjera (potwierdzenie zakonczenia kasowania) */
+    if (sent_to_cashier) {
+        CashierReply reply;
+        int got_reply = 0;
+        
+        /* Czekaj na wiadomosc z mtype = nasz PID */
+        while (!got_reply && !g_stop && !g_evac) {
+            ssize_t r = msgrcv(h.msg_id[cashier], &reply, sizeof(CashierReply) - sizeof(long), 
+                              (long)getpid(), 0);
+            if (r == -1) {
+                if (errno == EINTR) {
+                    /* Sprawdz czy sygnal zamykajacy */
+                    if (g_stop || g_evac) break;
+                    continue;
+                }
+                perror("msgrcv(wait for cashier reply)");
+                break;
+            }
+            got_reply = 1;
+        }
+        
+        if (got_reply) {
+            if (reply.success) {
+                LOGF("klient", "Zaplacono %.2f zl przy kasie %d", reply.total_price, reply.cashier_id);
+                msleep(rand_between(200, 400)); /* czas pakowania zakupow */
+            } else {
+                LOGF("klient", "Kasowanie przerwane (ewakuacja/zamkniecie)");
+>>>>>>> Stashed changes
             }
         }
     }

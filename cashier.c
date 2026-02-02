@@ -47,8 +47,16 @@ static void process_sale(BakeryState* st, int sem_id, int cashier_id, const Clie
     }
     shm_unlock(sem_id);
 
+<<<<<<< Updated upstream
     msleep(rand_between(500, 800));
     /* TODO: "wydruk paragonu" z nazwami i cenami: st->produkty[pid].nazwa, st->produkty[pid].cena */
+=======
+    /* Symulacja kasowania - czas proporcjonalny do liczby pozycji */
+    int kasowanie_ms = 300 + msg->item_count * 150;
+    msleep(kasowanie_ms);
+    
+    return total_price;
+>>>>>>> Stashed changes
 }
 
 int main(int argc, char** argv) {

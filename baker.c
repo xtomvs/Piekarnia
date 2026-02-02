@@ -67,9 +67,30 @@ int main(void) {
             int qty = rand_between(1, 5);
 
             for (int k = 0; k < qty; ++k) {
-                if (g_stop) break;
+                if (g_stop || g_evac) break;
                 /* Czekaj na miejsce na podajniku pid */
-                sem_P(h.sem_id, SEM_CONV_EMPTY(pid));
+                int empty_slots = semctl(h.sem_id, SEM_CONV_EMPTY(pid), GETVAL);
+                if (empty_slots == 0) {
+                    LOGF("piekarz", "Taśma pełna dla %s, czekam...", st->produkty[pid].nazwa);
+                }
+                
+                /* Przerywalne oczekiwanie na semafor */
+                struct sembuf sop = { .sem_num = SEM_CONV_EMPTY(pid), .sem_op = -1, .sem_flg = 0 };
+                while (semop(h.sem_id, &sop, 1) == -1) {
+                    if (errno == EINTR) {
+                        if (g_stop || g_evac) goto cleanup;
+                        continue;
+                    }
+                    perror("semop(baker EMPTY)");
+                    goto cleanup;
+                }
+                
+                if (g_stop || g_evac) {
+                    /* Oddaj semafor i wyjdź */
+                    sem_V(h.sem_id, SEM_CONV_EMPTY(pid));
+                    goto cleanup;
+                }
+                
                 sem_P(h.sem_id, SEM_CONV_MUTEX(pid));
 
                 /* Sekcja krytyczna: dopisac na tail (FIFO) */
@@ -104,8 +125,45 @@ int main(void) {
                 LOGF("piekarz", "Wypiek: %s x%d", st->produkty[i].nazwa, wyprodukowano[i]);
             }
         }
+<<<<<<< Updated upstream
         /* TODO: czas między wypiekami */
         msleep(rand_between(200, 600));
+=======
+        msleep(rand_between(100, 300)); 
+    }
+
+cleanup:
+    /* Inwentaryzacja: podsumowanie wytworzonych produktow */
+    /* Wypisz raport zawsze przy zamknięciu sklepu lub ewakuacji */
+    shm_lock(h.sem_id);
+    int inv = st->inventory_mode;
+    int closed = !st->store_open;
+    int evac = st->evacuated;
+    shm_unlock(h.sem_id);
+    
+    if (inv || closed || evac) {
+        fprintf(stdout, "\n" COLOR_PIEKARZ);
+        fprintf(stdout, "╔══════════════════════════════════════════════════════════╗\n");
+        fprintf(stdout, "║       🥖 RAPORT PIEKARZA - WYPRODUKOWANE PRODUKTY        ║\n");
+        fprintf(stdout, "╠══════════════════════════════════════════════════════════╣\n");
+        fprintf(stdout, ANSI_RESET);
+        
+        int total = 0;
+        shm_lock(h.sem_id);
+        for (int i = 0; i < P; ++i) {
+            int qty = st->produced[i];
+            if (qty > 0) {
+                fprintf(stdout, COLOR_PIEKARZ "║" ANSI_RESET "  P%02d: %-30s %6d szt.        " COLOR_PIEKARZ "║" ANSI_RESET "\n", 
+                        i, st->produkty[i].nazwa, qty);
+                total += qty;
+            }
+        }
+        shm_unlock(h.sem_id);
+        
+        fprintf(stdout, COLOR_PIEKARZ "╠══════════════════════════════════════════════════════════╣" ANSI_RESET "\n");
+        fprintf(stdout, COLOR_PIEKARZ "║" ANSI_RESET "  " ANSI_BOLD "SUMA WYPRODUKOWANYCH: %6d szt." ANSI_RESET "                       " COLOR_PIEKARZ "║" ANSI_RESET "\n", total);
+        fprintf(stdout, COLOR_PIEKARZ "╚══════════════════════════════════════════════════════════╝" ANSI_RESET "\n");
+>>>>>>> Stashed changes
     }
 
     /* TODO: jeśli ewakuacja – zakończ szybko */

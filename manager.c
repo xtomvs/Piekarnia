@@ -9,8 +9,18 @@
  *  - pozostałe programy robią tylko własne funkcjonalności.
  */
 
+<<<<<<< Updated upstream
 #define MAX_CLIENTS_TOTAL 50     
 #define SPAWN_COOLDOWN_MS 150 /* max 1 klient na 300ms */
+=======
+#define MAX_CLIENTS_TOTAL 500
+#define SPAWN_COOLDOWN_MS 200    /* minimalny odstep miedzy spawnem klientow (ms) */
+
+/* Flagi trybu testowego */
+static int g_test_mode = 0;
+static int g_stress_mode = 0;
+static int g_test_client_count = 1000; 
+>>>>>>> Stashed changes
 
 /* Flagi ustawiane w handlerze sygnału */
 static volatile sig_atomic_t g_sig_evac = 0;
@@ -70,10 +80,10 @@ static int desired_open_cashiers(const BakeryState* st) {
     int c = st->customers_in_store;
     int N = st->N;
 
-    int t1_on  = (N / 3) + 1;         /* np. 4 */
-    int t1_off = (N / 3) - 1;         /* np. 2 */
-    int t2_on  = (2 * N / 3) + 1;     /* np. 7 */
-    int t2_off = (2 * N / 3) - 1;     /* np. 5 */
+    int t1_on  = (N / 3) + 1;         
+    int t1_off = (N / 3) - 1;         
+    int t2_on  = (2 * N / 3) + 1;    
+    int t2_off = (2 * N / 3) - 1;    
 
     if (t1_off < 0) t1_off = 0;
     if (t2_off < 0) t2_off = 0;
@@ -145,11 +155,13 @@ static void ctrl_fifo_poll(int fd) {
     if (n <= 0) return;
     buf[n] = '\0';
 
-    /* Proste komendy: EVAC, INV, STATUS */
+    /* Proste komendy: EVAC, INV, CLOSE, STATUS */
     if (strstr(buf, "EVAC")) {
         g_sig_evac = 1;
     } else if (strstr(buf, "INV")) {
         g_sig_inv = 1;
+    } else if (strstr(buf, "CLOSE")) {
+        g_sig_term = 1;
     } else if (strstr(buf, "STATUS")) {
         /* TODO: można ustawić flagę i wypisać status w pętli */
     }
@@ -207,9 +219,15 @@ int main(int argc, char** argv) {
 
 
     int P = 15;
+<<<<<<< Updated upstream
     int N = 9;
     int Tp = 6;     
     int Tk = 20;    
+=======
+    int N = 30;        /* limit klientow w sklepie */
+    int Tp = 6;        /* otwarcie: 6:00 */
+    int Tk = 22;       /* zamkniecie: 22:00 */
+>>>>>>> Stashed changes
     Product produkty[MAX_P];
     int Ki[MAX_P];
     int spawned_clients_total = 0;
