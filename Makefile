@@ -31,4 +31,21 @@ clean:
 	rm -f *.o $(BIN)
 	rm -f .bakery_ipc_key bakery_ctrl.fifo
 
-.PHONY: all clean
+# Wyczyść zasoby IPC (użyj przed ponownym uruchomieniem jeśli poprzedni się nie zakończył poprawnie)
+ipcclean:
+	@echo "Czyszczenie zasobów IPC..."
+	@ipcs -m | grep "$$(whoami | cut -c1-10)" | awk '{print $$2}' | while read id; do ipcrm -m $$id 2>/dev/null; done || true
+	@ipcs -s | grep "$$(whoami | cut -c1-10)" | awk '{print $$2}' | while read id; do ipcrm -s $$id 2>/dev/null; done || true
+	@ipcs -q | grep "$$(whoami | cut -c1-10)" | awk '{print $$2}' | while read id; do ipcrm -q $$id 2>/dev/null; done || true
+	@rm -f .bakery_ipc_key bakery_ctrl.fifo
+	@echo "Gotowe."
+
+# Uruchom z czyszczeniem IPC
+run: ipcclean
+	./manager
+
+# Uruchom test z czyszczeniem IPC
+test: ipcclean
+	./manager test 50
+
+.PHONY: all clean ipcclean run test

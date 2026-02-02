@@ -3,10 +3,10 @@
 /*
  * client.c – proces klienta:
  *  - czeka na wolne miejsce w sklepie (SEM_STORE_SLOTS)
- *  - robi zakupy: losuje listę min. 2 różne produkty, próbuje zdjąć z podajników FIFO
- *  - jeśli produkt niedostępny, nie kupuje
- *  - idzie do kasy i wysyła koszyk (msgsnd)
- *  - reaguje na ewakuację: przerywa i odkłada do kosza przy kasach (st->wasted[Pi])
+ *  - robi zakupy: losuje liste min. 2 rozne produkty, probuje zdjac z podajnikow FIFO
+ *  - jesli produkt niedostepny, nie kupuje
+ *  - idzie do kasy i wysyla koszyk (msgsnd)
+ *  - reaguje na ewakuacje: przerywa i odklada do kosza przy kasach (st->wasted[Pi])
  */
 
 static volatile sig_atomic_t g_evac = 0;
@@ -15,17 +15,11 @@ static volatile sig_atomic_t g_stop = 0;
 static void handler(int sig) {
     if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; }
     else if (sig == SIG_INV) {
-        /* inwentaryzacja: nie zatrzymuje procesów */
+        /* inwentaryzacja: nie zatrzymuje procesow */
         return;
     } else {
         g_stop = 1; /* SIGINT / SIGTERM */
     }
-}
-
-/* Wybór dwóch różnych produktów */
-static void pick_two_distinct(int P, int* a, int* b) {
-    *a = rand_between(0, P - 1);
-    do { *b = rand_between(0, P - 1); } while (*b == *a);
 }
 
 static int choose_cashier(const BakeryState* st) {
@@ -34,7 +28,7 @@ static int choose_cashier(const BakeryState* st) {
     
     for (int i = 0; i < CASHIERS; ++i) {
         if (st->cashier_open[i] && st->cashier_accepting[i]) {
-            int len = st->cashier_queue_len[i]; /* zakładamy, że pole istnieje w SHM */
+            int len = st->cashier_queue_len[i];
             if (len < best_len) {
                 best_len = len;
                 best = i;
@@ -43,7 +37,7 @@ static int choose_cashier(const BakeryState* st) {
     }
     
     if (best != -1) {
-        /* 2) jeśli kolejka > 2, spróbuj inną kasę accepting z kolejką <=2 */
+        /* jesli kolejka > 2, sprobuj inna kase accepting z kolejka <=2 */
         if (best_len > 2) {
             for (int i = 0; i < CASHIERS; ++i) {
                 if (i == best) continue;
@@ -62,31 +56,25 @@ static int choose_cashier(const BakeryState* st) {
     return 0;
 }
 
-static void wait_before_store(int sem_id) {
-    int said_waiting = 0;
-
-    for (;;) {
-        if (sem_P_nowait(sem_id, SEM_STORE_SLOTS) == 0) {
-            if (said_waiting) {
-                LOGF("klient", "Wchodzę do sklepu (zwolniło się miejsce).");
-            }
-            return; /* mamy “slot” w sklepie */
+/* Proba wejscia z przerwaniem przez sygnal - zwraca 0 jesli sukces, -1 jesli sygnal */
+static int sem_P_interruptible(int sem_id, int sem_num) {
+    struct sembuf op;
+    op.sem_num = (unsigned short)sem_num;
+    op.sem_op  = -1;
+    op.sem_flg = 0; /* blokujace, ale przerywane przez sygnaly */
+    
+    while (semop(sem_id, &op, 1) == -1) {
+        if (errno == EINTR) {
+            /* Sprawdz czy to sygnal zamykajacy */
+            if (g_stop || g_evac) return -1;
+            continue; /* inne przerwanie - kontynuuj czekanie */
         }
+        perror("semop(SEM_STORE_SLOTS)");
+        return -1;
+    }
+    return 0;
+}
 
-<<<<<<< Updated upstream
-        if (errno == EAGAIN) {
-            if (!said_waiting) {
-                LOGF("klient", "Czekam przed sklepem – brak wolnych miejsc.");
-                said_waiting = 1;
-            }
-            msleep(200);
-            continue;
-        }
-
-        if (errno == EINTR) continue;
-
-        DIE_PERROR("sem_P_nowait(SEM_STORE_SLOTS)");
-=======
 static int wait_before_store(int sem_id, BakeryState* st) {
     /* Najpierw sprawdz czy jest sens czekac */
     int current_val = semctl(sem_id, SEM_STORE_SLOTS, GETVAL);
@@ -118,8 +106,9 @@ static int wait_before_store(int sem_id, BakeryState* st) {
             }
             return -1;
         }
->>>>>>> Stashed changes
     }
+    
+    return 0; /* sukces - mamy slot */
 }
 
 
@@ -158,25 +147,28 @@ int main(void) {
         return 0;
     }
 
-    /* Wejście do sklepu (limit N) */
-    wait_before_store(h.sem_id);
-
-    /* Zwiększ customers_in_store */
+    /* Wejscie do sklepu (limit N) - blokujace oczekiwanie z obsluga sygnalow */
+    if (wait_before_store(h.sem_id, st) == -1) {
+        /* Sygnal przerwal oczekiwanie lub blad */
+        if (g_evac || g_stop) {
+            LOGF("klient", "Nie wszedlem do sklepu - ewakuacja/zamkniecie.");
+        }
+        ipc_detach_or_die(st);
+        return 0;
+    }
+    
+    /* Zwieksz customers_in_store atomowo */
     shm_lock(h.sem_id);
     st->customers_in_store++;
-    LOGF("klient", "Wchodzę do sklepu (klientów w sklepie: %d)", st->customers_in_store);
+    int curr_count = st->customers_in_store;
+    LOGF("klient", "Wchodze do sklepu (klientow w sklepie: %d/%d)", curr_count, st->N);
     shm_unlock(h.sem_id);
 
-<<<<<<< Updated upstream
-    /* czas wejścia/rozejrzenia się */
-    msleep(rand_between(300, 800));
-=======
     /* czas wejscia/rozejrzenia sie */
     LOGF("klient", "Rozgladam sie po sklepie...");
     msleep(rand_between(500, 1000));
->>>>>>> Stashed changes
 
-    /* Losowa lista zakupów: min 2 różne produkty, dołóż dodatkowe z pewnym prawdopodobieństwem */
+    /* Losowa lista zakupow: min 2 rozne produkty */
     int want_count = 2 + (rand_between(0, 100) < 40 ? 1 : 0); /* 2 lub 3 */
     if (want_count > MAX_BASKET_ITEMS) want_count = MAX_BASKET_ITEMS;
 
@@ -185,30 +177,33 @@ int main(void) {
     msg.mtype = 1;
     msg.client_pid = getpid();
 
-    /*  wybierz losowe produkty i ilości */
+    /* wybierz losowe produkty i ilosci */
     int used[MAX_P] = {0};
 
     for (int i = 0; i < want_count; ++i) {
-        /* poruszanie się po sklepie między podajnikami */
-        msleep(rand_between(300, 800));
+        /* poruszanie sie po sklepie miedzy podajnikami */
+        msleep(rand_between(50, 150));
         if (g_stop) break;
         int pid;
         do { pid = rand_between(0, P - 1); } while (used[pid]);
         used[pid] = 1;
 
-        int qty = rand_between(1, 4);
+        int qty = rand_between(1, 3);
 
-        /* Pobierz z podajnika, ale jeśli brak – nie kupuj */
+        /* Pobierz z podajnika, ale jesli brak - nie kupuj */
         int bought = 0;
         for (int k = 0; k < qty; ++k) {
-            /* czas na znalezienie produktu / sięgnięcie po kolejną sztukę */
-            msleep(rand_between(300, 800));
+            /* czas na znalezienie produktu / siegniecie po kolejna sztuke */
+            msleep(rand_between(50, 150));
             if (g_evac || g_stop) break;
 
-            /* sprobwowac nowait na FULL */
+            /* sprobowac nowait na FULL */
             if (sem_P_nowait(h.sem_id, SEM_CONV_FULL(pid)) == -1) {
                 if (errno == EAGAIN) {
                     /* brak towaru */
+                    if (k == 0) {
+                        LOGF("klient", "Brak produktu %d na podajniku - pomijam", pid);
+                    }
                     break;
                 } else {
                     perror("semop NOWAIT FULL");
@@ -221,7 +216,7 @@ int main(void) {
             /* Zdejmij z head (FIFO) */
             Conveyor* cv = &st->conveyors[pid];
 
-            /* Sprawdzenie poprawności capacity (Ki) – bezpieczeństwo przed modulo przez 0 */
+            /* Sprawdzenie poprawnosci capacity (Ki) - bezpieczenstwo przed modulo przez 0 */
             if (cv->capacity <= 0 || cv->capacity > MAX_KI) {
                 fprintf(stderr, "[client %d] ERROR: invalid capacity=%d for product %d (MAX_KI=%d)\n", (int)getpid(), cv->capacity, pid, MAX_KI);
                 /* Cofnij pobranie z FULL (bo nie zdejmujemy faktycznie towaru) */
@@ -264,11 +259,11 @@ int main(void) {
         }
     }
 
-    /* Ewakuacja: odkładamy do kosza i wychodzimy */
+    /* Ewakuacja: odkladamy do kosza i wychodzimy */
     if (g_evac) {
-        LOGF("klient", "EWAKUACJA! Odkładam towar do kosza i wychodzę.");
+        LOGF("klient", "EWAKUACJA! Odkladam towar do kosza i wychodze.");
         shm_lock(h.sem_id); 
-        LOGF("klient", "Zakończono zakupy, liczba pozycji w koszyku: %d", msg.item_count);
+        LOGF("klient", "Zakonczono zakupy, liczba pozycji w koszyku: %d", msg.item_count);
         for (int i = 0; i < msg.item_count; ++i) {
             int pid = msg.items[i].product_id;
             int qty = msg.items[i].quantity;
@@ -276,7 +271,7 @@ int main(void) {
         }
         shm_unlock(h.sem_id);
 
-        /* Wyjście */
+        /* Wyjscie */
         shm_lock(h.sem_id);
         st->customers_in_store--;
         shm_unlock(h.sem_id);
@@ -286,34 +281,31 @@ int main(void) {
         return 0;
     }
 
-    /* Wybierz kasę i wyślij koszyk */
+    /* Wybierz kase i wyslij koszyk */
     int cashier = 0;
     shm_lock(h.sem_id);
     cashier = choose_cashier(st);
     shm_unlock(h.sem_id);
 
-    /* Jeśli koszyk pusty, klient może iść prosto do wyjścia */
+    int sent_to_cashier = 0;  /* czy wyslano do kasy i trzeba czekac na odpowiedz */
+
+    /* Jesli koszyk pusty, klient moze isc prosto do wyjscia */
     if (msg.item_count > 0) {
-        /* zanim wyśle, upewnij się że kasa nadal przyjmuje */
+        /* zanim wysle, upewnij sie ze kasa nadal przyjmuje */
         shm_lock(h.sem_id);
         int ok = st->cashier_open[cashier] && st->cashier_accepting[cashier] && !st->evacuated && st->store_open;
         if (ok) st->cashier_queue_len[cashier]++;  /* klient "staje w kolejce" */
         shm_unlock(h.sem_id);
 
         if (ok) {
-            fprintf(stdout, "[klient pid=%d] Wysyłam koszyk do kasy %d, item_count=%d\n",
-                (int)getpid(), cashier, msg.item_count);
+            LOGF("klient", "Wysylam koszyk do kasy %d, item_count=%d", cashier, msg.item_count);
             if (msgsnd(h.msg_id[cashier], &msg, sizeof(ClientMsg) - sizeof(long), 0) == -1) {
                 perror("msgsnd(client)");
-                /* cofnij licznik kolejki jeśli się nie udało */
+                /* cofnij licznik kolejki jesli sie nie udalo */
                 shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier] > 0) st->cashier_queue_len[cashier]--;
                 shm_unlock(h.sem_id);
-                /* TODO: ewentualnie spróbować inną kasę */
             } else {
-<<<<<<< Updated upstream
-                LOGF("klient", "Wybrałem kasę %d (długość kolejki: %d)", cashier, st->cashier_queue_len[cashier]);
-=======
                 LOGF("klient", "Wybralem kase %d (dlugosc kolejki: %d), czekam na kasowanie...", cashier, st->cashier_queue_len[cashier]);
                 sent_to_cashier = 1;
             }
@@ -351,14 +343,15 @@ int main(void) {
                 msleep(rand_between(200, 400)); /* czas pakowania zakupow */
             } else {
                 LOGF("klient", "Kasowanie przerwane (ewakuacja/zamkniecie)");
->>>>>>> Stashed changes
             }
+        } else if (g_evac) {
+            LOGF("klient", "Ewakuacja podczas oczekiwania na kase - wychodze");
         }
     }
 
-    msleep(rand_between(50, 250));
+    /* Wyjscie */
+    LOGF("klient", "Wychodze ze sklepu.");
 
-    /* Wyjście */
     shm_lock(h.sem_id);
     st->customers_in_store--;
     shm_unlock(h.sem_id);
@@ -366,6 +359,5 @@ int main(void) {
     sem_V(h.sem_id, SEM_STORE_SLOTS);
 
     ipc_detach_or_die(st);
-    LOGF("klient", "Wychodzę ze sklepu.");
     return 0;
 }

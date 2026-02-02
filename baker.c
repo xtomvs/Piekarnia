@@ -48,6 +48,30 @@ int main(void) {
 
     LOGF("piekarz", "Start pracy. Liczba produktów: %d", P);
 
+    /* Faza rozgrzewki - wyprodukuj troche na zapas zanim klienci zaczna wchodzic */
+    for (int warmup = 0; warmup < 3 && !g_stop; warmup++) {
+        for (int pid = 0; pid < P && !g_stop; ++pid) {
+            int qty = rand_between(2, 4);
+            for (int k = 0; k < qty && !g_stop; ++k) {
+                if (sem_P_nowait(h.sem_id, SEM_CONV_EMPTY(pid)) == -1) {
+                    if (errno == EAGAIN) break; /* pelny podajnik */
+                    continue;
+                }
+                sem_P(h.sem_id, SEM_CONV_MUTEX(pid));
+                Conveyor* cv = &st->conveyors[pid];
+                if (cv->capacity > 0 && cv->capacity <= MAX_KI) {
+                    cv->items[cv->tail] = 1;
+                    cv->tail = (cv->tail + 1) % cv->capacity;
+                    cv->count++;
+                    st->produced[pid]++;
+                }
+                sem_V(h.sem_id, SEM_CONV_MUTEX(pid));
+                sem_V(h.sem_id, SEM_CONV_FULL(pid));
+            }
+        }
+    }
+    LOGF("piekarz", "Rozgrzewka zakonczona - produkty na polkach.");
+
     while (!g_stop) {
         /* Sprawdź czy sklep otwarty */
         shm_lock(h.sem_id);
@@ -125,10 +149,6 @@ int main(void) {
                 LOGF("piekarz", "Wypiek: %s x%d", st->produkty[i].nazwa, wyprodukowano[i]);
             }
         }
-<<<<<<< Updated upstream
-        /* TODO: czas między wypiekami */
-        msleep(rand_between(200, 600));
-=======
         msleep(rand_between(100, 300)); 
     }
 
@@ -163,10 +183,8 @@ cleanup:
         fprintf(stdout, COLOR_PIEKARZ "╠══════════════════════════════════════════════════════════╣" ANSI_RESET "\n");
         fprintf(stdout, COLOR_PIEKARZ "║" ANSI_RESET "  " ANSI_BOLD "SUMA WYPRODUKOWANYCH: %6d szt." ANSI_RESET "                       " COLOR_PIEKARZ "║" ANSI_RESET "\n", total);
         fprintf(stdout, COLOR_PIEKARZ "╚══════════════════════════════════════════════════════════╝" ANSI_RESET "\n");
->>>>>>> Stashed changes
     }
 
-    /* TODO: jeśli ewakuacja – zakończ szybko */
     if (g_evac) LOGF("piekarz", "Kończę pracę (ewakuacja).");
     else        LOGF("piekarz", "Kończę pracę.");
 

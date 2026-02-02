@@ -26,7 +26,6 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/wait.h>
 
 /* =========================
  *  Konfiguracja projektu
@@ -73,8 +72,34 @@
     }                                              \
 } while (0)
 
+/* =========================
+ *  Kolory ANSI dla terminala
+ * ========================= */
+#define ANSI_RESET      "\033[0m"
+#define ANSI_BOLD       "\033[1m"
+
+#define ANSI_RED        "\033[31m"
+#define ANSI_GREEN      "\033[32m"
+#define ANSI_YELLOW     "\033[33m"
+#define ANSI_BLUE       "\033[34m"
+#define ANSI_MAGENTA    "\033[35m"
+#define ANSI_CYAN       "\033[36m"
+#define ANSI_WHITE      "\033[37m"
+
+/* Kolory dla poszczególnych procesów */
+#define COLOR_KIEROWNIK ANSI_BOLD ANSI_YELLOW   /* żółty - szef */
+#define COLOR_PIEKARZ   ANSI_BOLD ANSI_RED      /* czerwony - gorący piec */
+#define COLOR_KASJER    ANSI_BOLD ANSI_GREEN    /* zielony - pieniądze */
+#define COLOR_KLIENT    ANSI_CYAN               /* cyjan - klient */
+
+/* Makro do kolorowego logowania - wybiera kolor na podstawie tagu */
 #define LOGF(tag, ...) do { \
-    fprintf(stdout, "[%s pid=%d] ", (tag), (int)getpid()); \
+    const char* _color = ANSI_WHITE; \
+    if (strcmp((tag), "kierownik") == 0) _color = COLOR_KIEROWNIK; \
+    else if (strcmp((tag), "piekarz") == 0) _color = COLOR_PIEKARZ; \
+    else if (strcmp((tag), "kasjer") == 0) _color = COLOR_KASJER; \
+    else if (strcmp((tag), "klient") == 0) _color = COLOR_KLIENT; \
+    fprintf(stdout, "%s[%s pid=%d]%s ", _color, (tag), (int)getpid(), ANSI_RESET); \
     fprintf(stdout, __VA_ARGS__); \
     fprintf(stdout, "\n"); \
 } while (0)
@@ -125,8 +150,6 @@ typedef struct BakeryState {
 
     Conveyor conveyors[MAX_P];    /* FIFO dla każdego produktu */
 
-    /* TODO: queue_len[3] do wyboru najmniejszej kolejki */
-    /* TODO: dodatkowe liczniki/metryki do sprawozdania */
 } BakeryState;
 
 /* =========================
@@ -141,8 +164,6 @@ typedef struct BakeryState {
  *      SEM_CONV_MUTEX(i)  : mutex na conveyor i
  *      SEM_CONV_EMPTY(i)  : licznik wolnych miejsc (Ki)
  *      SEM_CONV_FULL(i)   : licznik sztuk dostępnych
- *
- * TODO: Przeanalizowac czy potrzeba osobnych mutexów dla kas, kolejek itp.
  */
 
 #define SEM_STORE_SLOTS     0
@@ -170,14 +191,21 @@ typedef struct BasketItem {
     int quantity;
 } BasketItem;
 
-/* Wiadomość klient -> kasjer (System V: musi zaczynać się od long mtype) */
+/* Wiadomość klient -> kasjer */
 typedef struct ClientMsg {
     long mtype;              /* np. 1 */
     pid_t client_pid;
     int item_count;
     BasketItem items[MAX_BASKET_ITEMS];
-    /* TODO: można dodać sumę, timestamp, itp. */
 } ClientMsg;
+
+/* Wiadomość kasjer -> klient (potwierdzenie zakończenia kasowania) */
+typedef struct CashierReply {
+    long mtype;              /* = client_pid (klient odbiera po swoim PID) */
+    int cashier_id;
+    double total_price;      /* suma do zapłaty */
+    int success;             /* 1 = OK, 0 = błąd */
+} CashierReply;
 
 /* =========================
  *  Uchwyt do zasobów IPC
@@ -227,11 +255,15 @@ void install_signal_handlers_or_die(void (*handler)(int));
 /* Pomocnicze: czas */
 void msleep(int ms);
 
+/* Kolorowe logowanie dla specjalnych komunikatów */
+void log_header(const char* title);
+void log_separator(void);
+
 #ifdef __cplusplus
 }
 #endif
 
-/* System V semctl wymaga union semun (nie zawsze zdefiniowane) */
+/* System V semctl wymaga union semun */
 union semun {
     int val;
     struct semid_ds* buf;

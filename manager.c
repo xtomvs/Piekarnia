@@ -1,18 +1,14 @@
 #include "common.h"
 
 /*
- * manager.c – program kierownika (główna pętla i sterowanie) i pętla sterująca symulacją.
+ * manager.c – program kierownika (glowna petla i sterowanie) i petla sterujaca symulacja.
  *
- * Zgodnie z Twoją decyzją:
- *  - to tutaj jest główna pętla programu, inicjalizacja IPC, uruchamianie procesów,
- *    polityka kas, generacja klientów, obsługa FIFO sterującego (opcjonalnie), sprzątanie.
- *  - pozostałe programy robią tylko własne funkcjonalności.
+ * TRYBY PRACY:
+ *   ./manager           - normalny tryb pracy (sklep otwarty wg godzin)
+ *   ./manager test N    - test przeciazeniowy z N klientami (domyslnie 1000)
+ *   ./manager stress    - test stresu z maksymalna liczba klientow
  */
 
-<<<<<<< Updated upstream
-#define MAX_CLIENTS_TOTAL 50     
-#define SPAWN_COOLDOWN_MS 150 /* max 1 klient na 300ms */
-=======
 #define MAX_CLIENTS_TOTAL 500
 #define SPAWN_COOLDOWN_MS 200    /* minimalny odstep miedzy spawnem klientow (ms) */
 
@@ -20,7 +16,6 @@
 static int g_test_mode = 0;
 static int g_stress_mode = 0;
 static int g_test_client_count = 1000; 
->>>>>>> Stashed changes
 
 /* Flagi ustawiane w handlerze sygnału */
 static volatile sig_atomic_t g_sig_evac = 0;
@@ -71,7 +66,7 @@ static void spawn_client_or_die(void) {
 }
 
 /* =========================
- *  Polityka kas (szkic)
+ *  Polityka kas 
  * ========================= */
 
 static int desired_open_cashiers(const BakeryState* st) {
@@ -163,7 +158,7 @@ static void ctrl_fifo_poll(int fd) {
     } else if (strstr(buf, "CLOSE")) {
         g_sig_term = 1;
     } else if (strstr(buf, "STATUS")) {
-        /* TODO: można ustawić flagę i wypisać status w pętli */
+        /* Można rozszerzyć o wypisanie statusu */
     }
 }
 
@@ -202,39 +197,90 @@ static void reap_children_nonblocking(void) {
 
 
 /* =========================
+ *  Statystyki testow
+ * ========================= */
+
+typedef struct TestStats {
+    int clients_spawned;
+    int clients_entered;
+    int clients_completed;
+    int max_concurrent;
+    int waiting_clients;
+    long long start_time_ms;
+    long long end_time_ms;
+} TestStats;
+
+static TestStats g_stats = {0};
+
+static void print_test_stats(const BakeryState* st) {
+    printf("\n========== STATYSTYKI TESTU ==========\n");
+    printf("Klientow wygenerowanych: %d\n", g_stats.clients_spawned);
+    printf("Max rownoczesnie w sklepie: %d (limit N=%d)\n", g_stats.max_concurrent, st->N);
+    printf("Czas trwania testu: %lld ms\n", g_stats.end_time_ms - g_stats.start_time_ms);
+    
+    int total_sold = 0;
+    int total_wasted = 0;
+    int total_produced = 0;
+    for (int i = 0; i < st->P; ++i) {
+        total_produced += st->produced[i];
+        total_wasted += st->wasted[i];
+        for (int c = 0; c < CASHIERS; ++c) {
+            total_sold += st->sold_by_cashier[c][i];
+        }
+    }
+    
+    printf("Produktow wyprodukowanych: %d\n", total_produced);
+    printf("Produktow sprzedanych: %d\n", total_sold);
+    printf("Produktow zmarnowanych (ewakuacja): %d\n", total_wasted);
+    printf("========================================\n\n");
+}
+
+
+/* =========================
  *  Main
  * ========================= */
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    (void)argc; (void)argv;
+    
+    /* Parsowanie argumentow */
+    if (argc >= 2) {
+        if (strcmp(argv[1], "test") == 0) {
+            g_test_mode = 1;
+            if (argc >= 3) {
+                g_test_client_count = atoi(argv[2]);
+                if (g_test_client_count <= 0) g_test_client_count = 1000;
+            }
+            printf("=== TRYB TESTOWY: %d klientow ===\n", g_test_client_count);
+        } else if (strcmp(argv[1], "stress") == 0) {
+            g_stress_mode = 1;
+            g_test_mode = 1;
+            g_test_client_count = 5000;
+            printf("=== TRYB STRESS: %d klientow ===\n", g_test_client_count);
+        }
+    }
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
     install_signal_handlers_or_die(signal_handler);
 
-    /* Utwórz osobną grupę procesów dla symulacji (żeby kill(-pgid, ...) nie dotknął powłoki) */
+    /* Utworz osobna grupe procesow dla symulacji (zeby kill(-pgid, ...) nie dotknol powloki) */
     CHECK_SYS(setpgid(0, 0), "setpgid(manager)");
     g_pgid = getpgrp();
 
 
     int P = 15;
-<<<<<<< Updated upstream
-    int N = 9;
-    int Tp = 6;     
-    int Tk = 20;    
-=======
     int N = 30;        /* limit klientow w sklepie */
     int Tp = 6;        /* otwarcie: 6:00 */
     int Tk = 22;       /* zamkniecie: 22:00 */
->>>>>>> Stashed changes
     Product produkty[MAX_P];
     int Ki[MAX_P];
     int spawned_clients_total = 0;
     long long last_spawn_ms = 0;
     long long last_policy_ms = 0;
+    long long last_stats_ms = 0;
 
-    /* Domyślna lista produktów (P=15) */
+    /* Domyslna lista produktow (P=15) */
     memset(produkty, 0, sizeof(produkty));
     strcpy(produkty[0].nazwa, "Bułka kajzerka");             produkty[0].cena = 3.0;
     strcpy(produkty[1].nazwa, "Bułka grahamka");            produkty[1].cena = 4.0;
@@ -311,8 +357,6 @@ int main(int argc, char** argv) {
 
     /* Ustawic semafory: store slots = N, empty[i]=Ki[i] */
     {
-        int sem_n = sem_count_for_P(P);
-        /* Pobrac aktualne i zmienic wybrane (prosto: semctl SETVAL) */
         union semun arg;
 
         arg.val = N;
@@ -321,42 +365,43 @@ int main(int argc, char** argv) {
         for (int i = 0; i < P; ++i) {
             arg.val = Ki[i];
             CHECK_SYS(semctl(h.sem_id, SEM_CONV_EMPTY(i), SETVAL, arg), "semctl(SETVAL EMPTY)");
-            /* MUTEX i FULL już OK */
         }
-
-        (void)sem_n; /* TODO: usunac jeśli nieużywane */
     }
 
     /* ====== Uruchom procesy ====== */
     spawn_baker_or_die();
     spawn_cashiers_or_die();
-    LOGF("kierownik", "Uruchomiono piekarza i %d kasjerów", CASHIERS);
+    LOGF("kierownik", "Uruchomiono piekarza i %d kasjerow", CASHIERS);
 
     /* Opcjonalny FIFO */
     int fifo_fd = ctrl_fifo_open_or_off();
 
-    /* ====== Główna pętla symulacji ====== */
+    /* Inicjalizacja statystyk */
+    g_stats.start_time_ms = now_ms();
     
+    int max_clients = g_test_mode ? g_test_client_count : MAX_CLIENTS_TOTAL;
 
+    /* ====== Glowna petla symulacji ====== */
+    
     while (!g_sig_term) {
-        /* Obsługa FIFO */
+        /* Obsluga FIFO */
         ctrl_fifo_poll(fifo_fd);
 
+        /* Zbieraj dzieci (zombie) */
         reap_children_nonblocking();
 
-        /* Obsługa sygnałów */
+        /* Obsluga sygnalow */
         if (g_sig_evac) {
             shm_lock(h.sem_id);
             st->evacuated = 1;
             st->store_open = 0;
             shm_unlock(h.sem_id);
 
-            /* Wyślij ewakuację do grupy procesów */
+            /* Wyslij ewakuacje do grupy procesow */
+            LOGF("kierownik", "EWAKUACJA! Wysylam sygnal do wszystkich procesow.");
             if (g_pgid > 0) {
-                LOGF("kierownik", "EWAKUACJA! Wysyłam sygnał do wszystkich procesów.");
                 CHECK_SYS(kill(-g_pgid, SIG_EVAC), "kill(-pgid, SIG_EVAC)");
             } else {
-                LOGF("kierownik", "EWAKUACJA! Wysyłam sygnał do wszystkich procesów.");
                 CHECK_SYS(kill(0, SIG_EVAC), "kill(0, SIG_EVAC)");
             }
 
@@ -367,23 +412,26 @@ int main(int argc, char** argv) {
             shm_lock(h.sem_id);
             st->inventory_mode = 1;
             shm_unlock(h.sem_id);
-            LOGF("kierownik", "INWENTARYZACJA: tryb włączony (klienci kupują do zamknięcia).");
+            LOGF("kierownik", "INWENTARYZACJA: tryb wlaczony (klienci kupuja do zamkniecia).");
             g_sig_inv = 0;
         }
 
-        int hour = current_hour_local();
+        /* W trybie testowym ignorujemy godziny */
+        if (!g_test_mode) {
+            int hour = current_hour_local();
 
-        if (hour < Tp) {
-        msleep(500);
-        continue;
-        }
+            if (hour < Tp) {
+                msleep(500);
+                continue;
+            }
 
-        if (hour >= Tk) {
-        shm_lock(h.sem_id);
-        st->store_open = 0;
-        shm_unlock(h.sem_id);
-        LOGF("kierownik", "Zamknięcie sklepu (godzina=%d >= %d).", hour, Tk);
-        break;
+            if (hour >= Tk) {
+                shm_lock(h.sem_id);
+                st->store_open = 0;
+                shm_unlock(h.sem_id);
+                LOGF("kierownik", "Zamkniecie sklepu (godzina=%d >= %d).", hour, Tk);
+                break;
+            }
         }
 
         /* Polityka kas */
@@ -393,74 +441,201 @@ int main(int argc, char** argv) {
             last_policy_ms = tnow;
         }
 
-        /* Generacja klientów */
-        int should_spawn = (rand_between(0, 100) < 35); /* ~35% iteracji */
+        /* Aktualizuj statystyki */
+        if (tnow - last_stats_ms >= 1000) {
+            shm_lock(h.sem_id);
+            int curr = st->customers_in_store;
+            if (curr > g_stats.max_concurrent) {
+                g_stats.max_concurrent = curr;
+            }
+            shm_unlock(h.sem_id);
+            
+            if (g_test_mode && (spawned_clients_total % 100 == 0 || spawned_clients_total == max_clients)) {
+                LOGF("kierownik", "[STATS] Spawned=%d/%d, InStore=%d, MaxConcurrent=%d",
+                     spawned_clients_total, max_clients, curr, g_stats.max_concurrent);
+            }
+            last_stats_ms = tnow;
+        }
+
+        /* Generacja klientow */
+        int should_spawn = g_test_mode ? 1 : (rand_between(0, 100) < 35);
         if (should_spawn) {
             long long t = now_ms();
 
             /* rate limit */
             if (t - last_spawn_ms < SPAWN_COOLDOWN_MS) {
-                /* za szybko – pomijamy */
-            } else if (spawned_clients_total >= MAX_CLIENTS_TOTAL) {
-                /* osiągnięto limit – pomijamy */
+                /* za szybko - pomijamy */
+            } else if (spawned_clients_total >= max_clients) {
+                /* osiagnieto limit - zakonczmy test */
+                if (g_test_mode) {
+                    LOGF("kierownik", "Wygenerowano wszystkich %d klientow. Czekam na zakonczenie...", max_clients);
+                    break;
+                }
             } else {
-                /* Nie spawnuj po zamknięciu sklepu (lub po ewakuacji) */
+                /* Nie spawnuj po zamknieciu sklepu (lub po ewakuacji) */
                 shm_lock(h.sem_id);
                 int open_now = (st->store_open && !st->evacuated);
                 shm_unlock(h.sem_id);
 
                 if (open_now) {
                     spawn_client_or_die();
-                    LOGF("kierownik", "Nowy klient (łącznie: %d/%d)", spawned_clients_total, MAX_CLIENTS_TOTAL);
                     spawned_clients_total++;
+                    g_stats.clients_spawned = spawned_clients_total;
                     last_spawn_ms = t;
+                    
+                    /* W trybie stress spawnuj szybciej */
+                    if (!g_stress_mode && spawned_clients_total % 50 == 0) {
+                        LOGF("kierownik", "Nowy klient (lacznie: %d/%d)", spawned_clients_total, max_clients);
+                    }
                 }
             }
         }
 
-        msleep(200); /* główna pętla co 200ms */
+        msleep(g_stress_mode ? 1 : 10); /* glowna petla */
     }
     
-    
-        
-
     /* ====== Faza zamykania ====== */
-    //TODO: inwentaryzacja
-    /* 1) Zamknij kasy dla nowych klientów (kasjerzy domkną kolejki) */
-    LOGF("kierownik", "Zamykanie kas dla nowych klientów (domykanie kolejek).");
+    
+    /* W trybie testowym poczekaj az klienci zrobia zakupy */
+    if (g_test_mode) {
+        LOGF("kierownik", "Czekam az klienci zrobia zakupy (sklep nadal otwarty)...");
+        int wait_shopping = 0;
+        while (wait_shopping < 50) { /* max 5 sekund */
+            shm_lock(h.sem_id);
+            int in_store = st->customers_in_store;
+            shm_unlock(h.sem_id);
+            if (in_store == 0) break;
+            msleep(100);
+            wait_shopping++;
+        }
+    }
+    
+    /* Zamknij sklep */
+    shm_lock(h.sem_id);
+    st->store_open = 0;
+    shm_unlock(h.sem_id);
+    
+    LOGF("kierownik", "Zamykanie kas dla nowych klientow (domykanie kolejek).");
     shm_lock(h.sem_id);
     for (int i = 0; i < CASHIERS; ++i) {
         st->cashier_accepting[i] = 0;
-        /* st->cashier_open[i] zostawiamy bez zmian:
-           kasjer sam domknie kolejkę i (w Twojej wersji cashier.c) ustawi cashier_open=0 */
     }
     shm_unlock(h.sem_id);
 
-    while (1) {
+    /* Czekaj az wszyscy klienci wyjda */
+    int wait_counter = 0;
+    int max_wait = g_test_mode ? 600 : 300; /* max 60s lub 30s */
+    while (wait_counter < max_wait) {
         shm_lock(h.sem_id);
         int in_store = st->customers_in_store;
         shm_unlock(h.sem_id);
 
         if (in_store <= 0) break;
-        msleep(200);
+        
+        if (wait_counter % 50 == 0) {
+            LOGF("kierownik", "Czekam na wyjscie klientow: %d pozostalo w sklepie", in_store);
+        }
+        
+        msleep(100);
+        wait_counter++;
+    }
+    
+    if (wait_counter >= max_wait) {
+        LOGF("kierownik", "TIMEOUT: Wymuszam zamkniecie (klienci mogli sie zablokowac)");
     }
 
-    LOGF("kierownik", "Wszyscy klienci opuścili sklep.");
+    g_stats.end_time_ms = now_ms();
+    LOGF("kierownik", "Wszyscy klienci opuscili sklep.");
 
-    /* 3) Poczekaj na dzieci */
+    /* Inwentaryzacja kierownika: towar na podajnikach */
+    shm_lock(h.sem_id);
+    int inv_mode = st->inventory_mode;
+    shm_unlock(h.sem_id);
+    
+    if (inv_mode) {
+        fprintf(stdout, "\n" COLOR_KIEROWNIK);
+        fprintf(stdout, "╔══════════════════════════════════════════════════════════╗\n");
+        fprintf(stdout, "║   📦 INWENTARYZACJA - KIEROWNIK - TOWAR NA PODAJNIKACH   ║\n");
+        fprintf(stdout, "╠══════════════════════════════════════════════════════════╣\n");
+        fprintf(stdout, ANSI_RESET);
+        
+        int total_on_conveyors = 0;
+        shm_lock(h.sem_id);
+        for (int i = 0; i < st->P; ++i) {
+            int on_conv = st->conveyors[i].count;
+            if (on_conv > 0) {
+                fprintf(stdout, COLOR_KIEROWNIK "║" ANSI_RESET "  P%02d: %-30s %6d szt.        " COLOR_KIEROWNIK "║" ANSI_RESET "\n", 
+                        i, st->produkty[i].nazwa, on_conv);
+                total_on_conveyors += on_conv;
+            }
+        }
+        shm_unlock(h.sem_id);
+        
+        if (total_on_conveyors == 0) {
+            fprintf(stdout, COLOR_KIEROWNIK "║" ANSI_RESET "  (wszystkie podajniki puste)                             " COLOR_KIEROWNIK "║" ANSI_RESET "\n");
+        }
+        
+        fprintf(stdout, COLOR_KIEROWNIK);
+        fprintf(stdout, "╠══════════════════════════════════════════════════════════╣\n");
+        fprintf(stdout, ANSI_RESET);
+        fprintf(stdout, COLOR_KIEROWNIK "║" ANSI_RESET "  " ANSI_BOLD "SUMA NA PODAJNIKACH: %6d szt." ANSI_RESET "                         " COLOR_KIEROWNIK "║" ANSI_RESET "\n", total_on_conveyors);
+        fprintf(stdout, COLOR_KIEROWNIK "╚══════════════════════════════════════════════════════════╝" ANSI_RESET "\n");
+        
+        /* Podsumowanie calkowite sprzedazy ze wszystkich kas */
+        fprintf(stdout, "\n" COLOR_KIEROWNIK);
+        fprintf(stdout, "╔══════════════════════════════════════════════════════════╗\n");
+        fprintf(stdout, "║   💰 INWENTARYZACJA - PODSUMOWANIE CAŁKOWITE SPRZEDAŻY   ║\n");
+        fprintf(stdout, "╠══════════════════════════════════════════════════════════╣\n");
+        fprintf(stdout, ANSI_RESET);
+        
+        int grand_total_items = 0;
+        double grand_total_value = 0.0;
+        
+        shm_lock(h.sem_id);
+        for (int i = 0; i < st->P; ++i) {
+            int total_sold = 0;
+            for (int c = 0; c < CASHIERS; ++c) {
+                total_sold += st->sold_by_cashier[c][i];
+            }
+            if (total_sold > 0) {
+                double value = total_sold * st->produkty[i].cena;
+                fprintf(stdout, COLOR_KIEROWNIK "║" ANSI_RESET "  P%02d: %-25s %4d × %6.2f = " ANSI_BOLD "%8.2f zł" ANSI_RESET " " COLOR_KIEROWNIK "║" ANSI_RESET "\n", 
+                        i, st->produkty[i].nazwa, total_sold, st->produkty[i].cena, value);
+                grand_total_items += total_sold;
+                grand_total_value += value;
+            }
+        }
+        shm_unlock(h.sem_id);
+        
+        if (grand_total_items == 0) {
+            fprintf(stdout, COLOR_KIEROWNIK "║" ANSI_RESET "  (brak sprzedazy)                                        " COLOR_KIEROWNIK "║" ANSI_RESET "\n");
+        }
+        
+        fprintf(stdout, COLOR_KIEROWNIK "╠══════════════════════════════════════════════════════════╣" ANSI_RESET "\n");
+        fprintf(stdout, COLOR_KIEROWNIK "║" ANSI_RESET "  " ANSI_BOLD ANSI_GREEN "SUMA: %4d szt., wartość: %12.2f zł" ANSI_RESET "             " COLOR_KIEROWNIK "║" ANSI_RESET "\n", 
+                grand_total_items, grand_total_value);
+        fprintf(stdout, COLOR_KIEROWNIK "╚══════════════════════════════════════════════════════════╝" ANSI_RESET "\n");
+    }
+
+    /* Wyswietl statystyki testowe */
+    if (g_test_mode) {
+        print_test_stats(st);
+    }
+
+    /* Poczekaj na dzieci */
     int status;
+    int children_reaped = 0;
     while (wait(&status) > 0) {
-        /* TODO: log exit codes */
+        children_reaped++;
     }
+    LOGF("kierownik", "Zakonczono %d procesow potomnych.", children_reaped);
 
     if (fifo_fd >= 0) close(fifo_fd);
-    /* TODO: unlink CTRL_FIFO_PATH jeśli używany */
-    /* unlink(CTRL_FIFO_PATH); */
+    unlink(CTRL_FIFO_PATH);
 
     ipc_detach_or_die(st);
     ipc_destroy_or_die(&h, P);
 
+    LOGF("kierownik", "Symulacja zakonczona pomyslnie.");
     return 0;
 }
-
-        

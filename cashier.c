@@ -5,9 +5,7 @@
  *  - odbiera wiadomości klientów z kolejki przypisanej do tej kasy
  *  - aktualizuje sold_by_cashier[cashier_id][Pi]
  *  - reaguje na zamykanie kasy: cashier_accepting=0 -> nie przyjmuje nowych, ale obsługuje kolejkę
- *
- * TODO: "paragon" – wypisywanie lub logowanie transakcji.
- * TODO: inwentaryzacja po zamknięciu sklepu: wydruk podsumowania.
+ *  - przy inventory_mode wypisuje podsumowanie sprzedaży
  */
 
 static volatile sig_atomic_t g_stop = 0;
@@ -23,40 +21,72 @@ static void handler(int sig) {
 }
 
 static void print_summary(const BakeryState* st, int cashier_id) {
-    /* TODO:  raport */
-    fprintf(stdout, "\n=== PODSUMOWANIE KASY %d ===\n", cashier_id);
+    fprintf(stdout, "\n" COLOR_KASJER);
+    fprintf(stdout, "╔══════════════════════════════════════════════════════════╗\n");
+    fprintf(stdout, "║       🧾 INWENTARYZACJA - KASA %d - SPRZEDANE PRODUKTY    ║\n", cashier_id);
+    fprintf(stdout, "╠══════════════════════════════════════════════════════════╣\n");
+    fprintf(stdout, ANSI_RESET);
+    
+    int total_items = 0;
+    double total_value = 0.0;
+    
     for (int i = 0; i < st->P; ++i) {
-        int s = st->sold_by_cashier[cashier_id][i];
-        if (s > 0) fprintf(stdout, "Produkt %d: %d szt.\n", i, s);
+        int qty = st->sold_by_cashier[cashier_id][i];
+        if (qty > 0) {
+            double value = qty * st->produkty[i].cena;
+            fprintf(stdout, COLOR_KASJER "║" ANSI_RESET "  P%02d: %-25s %4d × %6.2f = " ANSI_BOLD "%8.2f zł" ANSI_RESET " " COLOR_KASJER "║" ANSI_RESET "\n", 
+                    i, st->produkty[i].nazwa, qty, st->produkty[i].cena, value);
+            total_items += qty;
+            total_value += value;
+        }
+    }
+    
+    if (total_items == 0) {
+        fprintf(stdout, COLOR_KASJER "║" ANSI_RESET "  (brak sprzedazy)                                        " COLOR_KASJER "║" ANSI_RESET "\n");
+    }
+    
+    fprintf(stdout, COLOR_KASJER "╠══════════════════════════════════════════════════════════╣" ANSI_RESET "\n");
+    fprintf(stdout, COLOR_KASJER "║" ANSI_RESET "  " ANSI_BOLD "SUMA KASA %d: %4d szt., wartość: %10.2f zł" ANSI_RESET "         " COLOR_KASJER "║" ANSI_RESET "\n", 
+            cashier_id, total_items, total_value);
+    fprintf(stdout, COLOR_KASJER "╚══════════════════════════════════════════════════════════╝" ANSI_RESET "\n");
+}
+
+/* Wysyła potwierdzenie do klienta że kasowanie zakończone */
+static void send_reply(int msg_id, pid_t client_pid, int cashier_id, double total_price, int success) {
+    CashierReply reply;
+    reply.mtype = (long)client_pid;  /* klient odbiera po swoim PID */
+    reply.cashier_id = cashier_id;
+    reply.total_price = total_price;
+    reply.success = success;
+    
+    if (msgsnd(msg_id, &reply, sizeof(CashierReply) - sizeof(long), 0) == -1) {
+        perror("msgsnd(reply to client)");
     }
 }
 
-static void process_sale(BakeryState* st, int sem_id, int cashier_id, const ClientMsg* msg) {
+static double process_sale(BakeryState* st, int sem_id, int cashier_id, const ClientMsg* msg) {
     /* Księgowanie zakupów kasjera (sztuki per produkt) */
-    fprintf(stdout,
-        "[kasjer pid=%d] KASUJĘ: klient_pid=%d, pozycji=%d (kasa=%d)\n",
-        (int)getpid(), (int)msg->client_pid, msg->item_count, cashier_id);
+    LOGF("kasjer", "KASUJĘ: klient_pid=%d, pozycji=%d (kasa=%d)",
+        (int)msg->client_pid, msg->item_count, cashier_id);
+    
+    double total_price = 0.0;
+    
     shm_lock(sem_id);
     for (int i = 0; i < msg->item_count; ++i) {
         int pid = msg->items[i].product_id;
         int qty = msg->items[i].quantity;
         if (pid >= 0 && pid < st->P && qty > 0) {
             st->sold_by_cashier[cashier_id][pid] += qty;
+            total_price += qty * st->produkty[pid].cena;
         }
-        /* TODO: pełna walidacja komunikatu (item_count range, qty range) */
     }
     shm_unlock(sem_id);
 
-<<<<<<< Updated upstream
-    msleep(rand_between(500, 800));
-    /* TODO: "wydruk paragonu" z nazwami i cenami: st->produkty[pid].nazwa, st->produkty[pid].cena */
-=======
     /* Symulacja kasowania - czas proporcjonalny do liczby pozycji */
     int kasowanie_ms = 300 + msg->item_count * 150;
     msleep(kasowanie_ms);
     
     return total_price;
->>>>>>> Stashed changes
 }
 
 int main(int argc, char** argv) {
@@ -150,9 +180,10 @@ int main(int argc, char** argv) {
                         LOGF("kasjer", "  - (BŁĘDNY PRODUKT pid=%d, qty=%d)", pid, qty);
                     }
                 }
-                process_sale(st, h.sem_id, cashier_id, &msg);
-                LOGF("kasjer", "Zakończyłem obsługę klienta pid=%d (kasa=%d)",
-                    (int)msg.client_pid, cashier_id);
+                double price1 = process_sale(st, h.sem_id, cashier_id, &msg);
+                send_reply(h.msg_id[cashier_id], msg.client_pid, cashier_id, price1, 1);
+                LOGF("kasjer", "Zakończyłem obsługę klienta pid=%d (kasa=%d, suma=%.2f zł)",
+                    (int)msg.client_pid, cashier_id, price1);
                 shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
                 shm_unlock(h.sem_id);
@@ -190,9 +221,12 @@ int main(int argc, char** argv) {
                     shm_lock(h.sem_id);
                     if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
                     shm_unlock(h.sem_id);
+                    /* Wyślij odpowiedź że przerwano (ewakuacja) */
+                    send_reply(h.msg_id[cashier_id], msg.client_pid, cashier_id, 0.0, 0);
                     break;
                 }
-                process_sale(st, h.sem_id, cashier_id, &msg);
+                double price2 = process_sale(st, h.sem_id, cashier_id, &msg);
+                send_reply(h.msg_id[cashier_id], msg.client_pid, cashier_id, price2, 1);
                 shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
                 shm_unlock(h.sem_id);
@@ -227,10 +261,13 @@ int main(int argc, char** argv) {
             shm_lock(h.sem_id);
             if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
             shm_unlock(h.sem_id);
+            /* Wyślij odpowiedź że przerwano (ewakuacja) */
+            send_reply(h.msg_id[cashier_id], msg.client_pid, cashier_id, 0.0, 0);
             break;
         }
 
-        process_sale(st, h.sem_id, cashier_id, &msg);
+        double price3 = process_sale(st, h.sem_id, cashier_id, &msg);
+        send_reply(h.msg_id[cashier_id], msg.client_pid, cashier_id, price3, 1);
         shm_lock(h.sem_id);
         if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
         shm_unlock(h.sem_id);
@@ -241,7 +278,7 @@ int main(int argc, char** argv) {
     int inv = st->inventory_mode;
     shm_unlock(h.sem_id);
 
-    if (inv && !g_evac) {
+    if (inv) {
         shm_lock(h.sem_id);
         print_summary(st, cashier_id);
         shm_unlock(h.sem_id);
