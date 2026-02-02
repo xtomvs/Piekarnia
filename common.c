@@ -11,7 +11,6 @@ void ensure_ipc_key_file_or_die(void) {
      */
     int fd = open(IPC_KEY_FILE, O_CREAT | O_RDWR, IPC_PERMS_MIN);
     if (fd == -1) DIE_PERROR("open(IPC_KEY_FILE)");
-    /* TODO: można zapisać do niego PID/znacznik wersji. */
     close(fd);
 }
 
@@ -74,22 +73,19 @@ void ipc_create_or_die(IpcHandles* out, int P) {
 
     init_state_defaults(st);
 
-    /* TODO: w bakery po walidacji uzupełnic P/N/Tp/Tk/ceny/Ki i conveyors[].capacity */
-    /* TODO: rozwazyc init losowego seed w bakery (srand). */
-
     /* Zainicjalizuj semafory */
     union semun arg;
     unsigned short* vals = calloc((size_t)sem_n, sizeof(unsigned short));
     if (!vals) DIE_PERROR("calloc sem vals");
 
-    /* SEM_STORE_SLOTS i SEM_SHM_GLOBAL uzupełni bakery po ustawieniu N */
-    vals[SEM_STORE_SLOTS] = 0; /* TODO: set N */
+    /* SEM_STORE_SLOTS i SEM_SHM_GLOBAL: ustawiane przez manager po inicjalizacji */
+    vals[SEM_STORE_SLOTS] = 0;
     vals[SEM_SHM_GLOBAL]  = 1;
 
-    /* Semafory per produkt: mutex=1, empty=Ki, full=0 (tu 0, Ki w bakery) */
+    /* Semafory per produkt: mutex=1, empty=0 (manager ustawi Ki[i]), full=0 */
     for (int i = 0; i < P; ++i) {
         vals[SEM_CONV_MUTEX(i)] = 1;
-        vals[SEM_CONV_EMPTY(i)] = 0; /* TODO: set Ki[i] */
+        vals[SEM_CONV_EMPTY(i)] = 0;
         vals[SEM_CONV_FULL(i)]  = 0;
     }
 
@@ -137,15 +133,13 @@ void ipc_destroy_or_die(const IpcHandles* h, int P) {
         CHECK_SYS(shmctl(h->shm_id, IPC_RMID, NULL), "shmctl(IPC_RMID)");
     }
 
-    /* TODO: usunac CTRL_FIFO_PATH jeśli używane */
-    /* TODO: usunac IPC_KEY_FILE jeśli chce (unlink) */
 }
 
 /* =========================
  *  Semafory: P/V
  * ========================= */
 
-static int semop_or_die(int sem_id, unsigned short sem_num, short delta, int flags) {
+static void semop_or_die(int sem_id, unsigned short sem_num, short delta, int flags) {
     struct sembuf op;
     op.sem_num = sem_num;
     op.sem_op  = delta;
@@ -179,10 +173,10 @@ void sem_V(int sem_id, int sem_num) {
 }
 
 void shm_lock(int sem_id) {
-    return sem_P(sem_id, SEM_SHM_GLOBAL);
+    sem_P(sem_id, SEM_SHM_GLOBAL);
 }
 void shm_unlock(int sem_id) {
-    return sem_V(sem_id, SEM_SHM_GLOBAL);
+    sem_V(sem_id, SEM_SHM_GLOBAL);
 }
 
 /* =========================
@@ -202,7 +196,7 @@ void msleep(int ms) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-        /* TODO: jeśli chce reagować na sygnały, sprawdic flagi globalne */
+        /* Przerwane sygnałem - kontynuuj jeśli jeszcze został czas */
     }
 }
 
@@ -211,11 +205,11 @@ void msleep(int ms) {
  * ========================= */
 
 int validate_config(int P, int N, int open_hour, int close_hour, const int* Ki, const Product* produkty) {
-    if (P <= 10 || P > MAX_P) return 0;
+    if (P < 10 || P > MAX_P) return 0;
     if (N <= 0) return 0;
-    if (N % 3 != 0) return 0;
+    //if (N % 3 != 0) return 0;
     if (open_hour < 0 || open_hour > 23) return 0;
-    if (close_hour < 0 || close_hour > 23) return 0;
+    if (close_hour < 1 || close_hour > 24) return 0;
     if (open_hour >= close_hour) return 0;
     if (!Ki || !produkty) return 0;
 
@@ -236,10 +230,10 @@ void install_signal_handlers_or_die(void (*handler)(int)) {
     sa.sa_handler = handler;
     sigemptyset(&sa.sa_mask);
 
-    /* TODO: rozważyc SA_RESTART vs własna obsługa EINTR */
+    /* Bez SA_RESTART - semop/msgrcv zwracają EINTR co pozwala na obsługę sygnałów */
     sa.sa_flags = 0;
 
-    CHECK_SYS(sigaction(SIG_EVAC, &sa, NULL), "sigaction(SIG_EVAC)");
+    CHECK_SYS(sigaction(SIG_EVAC, &sa, NULL), "sigaction(SIG_EVAC)");;
     CHECK_SYS(sigaction(SIG_INV, &sa, NULL), "sigaction(SIG_INV)");
 
     /* sprzątanie po Ctrl+C */
