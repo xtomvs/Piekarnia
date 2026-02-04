@@ -21,12 +21,14 @@ static int g_test_client_count = 1000;
 static volatile sig_atomic_t g_sig_evac = 0;
 static volatile sig_atomic_t g_sig_inv  = 0;
 static volatile sig_atomic_t g_sig_term = 0;
+static volatile sig_atomic_t g_sig_chld = 0;
 
 static pid_t g_pgid = -1;
 
 static void signal_handler(int sig) {
     if (sig == SIG_EVAC) g_sig_evac = 1;
     else if (sig == SIG_INV) g_sig_inv = 1;
+    else if (sig == SIGCHLD) g_sig_chld = 1;
     else g_sig_term = 1; /* SIGINT / SIGTERM */
 }
 
@@ -173,21 +175,33 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+static int g_reaped_count = 0;
+
 static void reap_children_nonblocking(void) {
     int status;
     pid_t pid;
+    int reaped_now = 0;
 
+    /* Zbieraj wszystkie zakończone dzieci w pętli */
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        if (WIFEXITED(status)) {
-            LOGF("kierownik", "Proces potomny pid=%d zakończył się kodem=%d",
-                 (int)pid, WEXITSTATUS(status));
-        } else if (WIFSIGNALED(status)) {
-            LOGF("kierownik", "Proces potomny pid=%d zakończony sygnałem=%d",
-                 (int)pid, WTERMSIG(status));
-        } else {
-            LOGF("kierownik", "Proces potomny pid=%d zakończony (status=%d)",
-                 (int)pid, status);
+        reaped_now++;
+        g_reaped_count++;
+        
+        /* W trybie stress/test nie loguj każdego dziecka - za wolne */
+        if (!g_stress_mode && !g_test_mode) {
+            if (WIFEXITED(status)) {
+                LOGF("kierownik", "Proces potomny pid=%d zakończył się kodem=%d",
+                     (int)pid, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                LOGF("kierownik", "Proces potomny pid=%d zakończony sygnałem=%d",
+                     (int)pid, WTERMSIG(status));
+            }
         }
+    }
+    
+    /* Loguj podsumowanie co 500 zebranych procesów */
+    if (g_stress_mode && reaped_now > 0 && (g_reaped_count % 500 < reaped_now)) {
+        LOGF("kierownik", "[REAP] Zebrano łącznie %d procesów potomnych", g_reaped_count);
     }
 
     /* waitpid == 0 -> brak zakończonych dzieci, waitpid == -1 -> np. brak dzieci (ECHILD) */
@@ -481,6 +495,11 @@ int main(int argc, char** argv) {
                     g_stats.clients_spawned = spawned_clients_total;
                     last_spawn_ms = t;
                     
+                    /* Co 5 klientów zbierz zombie (bardziej agresywnie) */
+                    if (spawned_clients_total % 5 == 0) {
+                        reap_children_nonblocking();
+                    }
+                    
                     /* W trybie stress spawnuj szybciej */
                     if (!g_stress_mode && spawned_clients_total % 50 == 0) {
                         LOGF("kierownik", "Nowy klient (lacznie: %d/%d)", spawned_clients_total, max_clients);
@@ -499,6 +518,7 @@ int main(int argc, char** argv) {
         LOGF("kierownik", "Czekam az klienci zrobia zakupy (sklep nadal otwarty)...");
         int wait_shopping = 0;
         while (wait_shopping < 50) { /* max 5 sekund */
+            reap_children_nonblocking();  /* zbieraj zombie podczas czekania */
             shm_lock(h.sem_id);
             int in_store = st->customers_in_store;
             shm_unlock(h.sem_id);
@@ -524,6 +544,8 @@ int main(int argc, char** argv) {
     int wait_counter = 0;
     int max_wait = g_test_mode ? 600 : 300; /* max 60s lub 30s */
     while (wait_counter < max_wait) {
+        reap_children_nonblocking();  /* zbieraj zombie podczas czekania */
+        
         shm_lock(h.sem_id);
         int in_store = st->customers_in_store;
         shm_unlock(h.sem_id);

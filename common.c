@@ -239,4 +239,8 @@ void install_signal_handlers_or_die(void (*handler)(int)) {
     /* sprzątanie po Ctrl+C */
     CHECK_SYS(sigaction(SIGINT, &sa, NULL), "sigaction(SIGINT)");
     CHECK_SYS(sigaction(SIGTERM, &sa, NULL), "sigaction(SIGTERM)");
+    
+    /* SIGCHLD dla zbierania zombie - bez blokowania */
+    sa.sa_flags = SA_NOCLDSTOP;  /* nie reaguj na zatrzymanie dziecka */
+    CHECK_SYS(sigaction(SIGCHLD, &sa, NULL), "sigaction(SIGCHLD)");
 }
