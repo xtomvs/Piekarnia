@@ -13,12 +13,13 @@ static volatile sig_atomic_t g_evac = 0;
 static volatile sig_atomic_t g_stop = 0;
 
 static void handler(int sig) {
-    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; }
+    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; g_common_stop = 1; }
     else if (sig == SIG_INV) {
         /* inwentaryzacja: nie zatrzymuje procesow */
         return;
     } else {
         g_stop = 1; /* SIGINT / SIGTERM */
+        g_common_stop = 1;
     }
 }
 
@@ -75,37 +76,21 @@ static int sem_P_interruptible(int sem_id, int sem_num) {
     return 0;
 }
 
-static int wait_before_store(int sem_id, BakeryState* st) {
+static int wait_before_store(int sem_id, const BakeryState* st_check) {
     /* Najpierw sprawdz czy jest sens czekac */
     int current_val = semctl(sem_id, SEM_STORE_SLOTS, GETVAL);
     
     if (current_val == 0) {
-        /* Zwiększ licznik czekających */
-        __sync_fetch_and_add(&st->waiting_before_store, 1);
-        int waiting = st->waiting_before_store;
-        LOGF("klient", "Czekam przed sklepem - brak wolnych miejsc (w sklepie: %d/%d, w kolejce: %d).", 
-             st->N, st->N, waiting);
-        
-        /* Blokujace oczekiwanie na semafor - przerywane przez sygnaly */
-        if (sem_P_interruptible(sem_id, SEM_STORE_SLOTS) == -1) {
-            __sync_fetch_and_sub(&st->waiting_before_store, 1);
-            if (g_stop || g_evac) {
-                LOGF("klient", "Przerywam oczekiwanie przed sklepem (sygnal).");
-                return -1;
-            }
+        LOGF("klient", "Czekam przed sklepem - brak wolnych miejsc (N=%d zajete).", st_check->N);
+    }
+    
+    /* Blokujace oczekiwanie na semafor - przerywane przez sygnaly */
+    if (sem_P_interruptible(sem_id, SEM_STORE_SLOTS) == -1) {
+        if (g_stop || g_evac) {
+            LOGF("klient", "Przerywam oczekiwanie przed sklepem (sygnal).");
             return -1;
         }
-        /* Zmniejsz licznik po wejściu */
-        __sync_fetch_and_sub(&st->waiting_before_store, 1);
-    } else {
-        /* Blokujace oczekiwanie na semafor - przerywane przez sygnaly */
-        if (sem_P_interruptible(sem_id, SEM_STORE_SLOTS) == -1) {
-            if (g_stop || g_evac) {
-                LOGF("klient", "Przerywam oczekiwanie przed sklepem (sygnal).");
-                return -1;
-            }
-            return -1;
-        }
+        return -1;
     }
     
     return 0; /* sukces - mamy slot */
@@ -165,8 +150,7 @@ int main(void) {
     shm_unlock(h.sem_id);
 
     /* czas wejscia/rozejrzenia sie */
-    LOGF("klient", "Rozgladam sie po sklepie...");
-    msleep(rand_between(500, 1000));
+    //msleep(rand_between(100, 300));
 
     /* Losowa lista zakupow: min 2 rozne produkty */
     int want_count = 2 + (rand_between(0, 100) < 40 ? 1 : 0); /* 2 lub 3 */
@@ -182,7 +166,7 @@ int main(void) {
 
     for (int i = 0; i < want_count; ++i) {
         /* poruszanie sie po sklepie miedzy podajnikami */
-        msleep(rand_between(50, 150));
+        /* msleep(rand_between(50, 150)); */  /* ZAKOMENTOWANO DLA TESTU */
         if (g_stop) break;
         int pid;
         do { pid = rand_between(0, P - 1); } while (used[pid]);
@@ -194,7 +178,7 @@ int main(void) {
         int bought = 0;
         for (int k = 0; k < qty; ++k) {
             /* czas na znalezienie produktu / siegniecie po kolejna sztuke */
-            msleep(rand_between(50, 150));
+            /* msleep(rand_between(50, 150)); */  /* ZAKOMENTOWANO DLA TESTU */
             if (g_evac || g_stop) break;
 
             /* sprobowac nowait na FULL */
@@ -299,8 +283,10 @@ int main(void) {
 
         if (ok) {
             LOGF("klient", "Wysylam koszyk do kasy %d, item_count=%d", cashier, msg.item_count);
-            if (msgsnd(h.msg_id[cashier], &msg, sizeof(ClientMsg) - sizeof(long), 0) == -1) {
-                perror("msgsnd(client)");
+            if (msgsnd(h.msg_id[cashier], &msg, sizeof(ClientMsg) - sizeof(long), IPC_NOWAIT) == -1) {
+                if (errno != EIDRM && errno != EINVAL && errno != EAGAIN) {
+                    perror("msgsnd(client)");
+                }
                 /* cofnij licznik kolejki jesli sie nie udalo */
                 shm_lock(h.sem_id);
                 if (st->cashier_queue_len[cashier] > 0) st->cashier_queue_len[cashier]--;
@@ -331,6 +317,7 @@ int main(void) {
                     if (g_stop || g_evac) break;
                     continue;
                 }
+                if (errno == EIDRM || errno == EINVAL) break;  /* IPC zniszczone */
                 perror("msgrcv(wait for cashier reply)");
                 break;
             }
@@ -340,7 +327,6 @@ int main(void) {
         if (got_reply) {
             if (reply.success) {
                 LOGF("klient", "Zaplacono %.2f zl przy kasie %d", reply.total_price, reply.cashier_id);
-                msleep(rand_between(200, 400)); /* czas pakowania zakupow */
             } else {
                 LOGF("klient", "Kasowanie przerwane (ewakuacja/zamkniecie)");
             }

@@ -7,12 +7,13 @@
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_evac = 0;
 static void handler(int sig) {
-    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; }
+    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; g_common_stop = 1; }
     else if (sig == SIG_INV) {
         /* inwentaryzacja: nie zatrzymuje procesów */
         return;
     } else {
         g_stop = 1; /* SIGINT / SIGTERM */
+        g_common_stop = 1;
     }
 }
 
@@ -91,30 +92,9 @@ int main(void) {
             int qty = rand_between(1, 5);
 
             for (int k = 0; k < qty; ++k) {
-                if (g_stop || g_evac) break;
+                if (g_stop) break;
                 /* Czekaj na miejsce na podajniku pid */
-                int empty_slots = semctl(h.sem_id, SEM_CONV_EMPTY(pid), GETVAL);
-                if (empty_slots == 0) {
-                    LOGF("piekarz", "Taśma pełna dla %s, czekam...", st->produkty[pid].nazwa);
-                }
-                
-                /* Przerywalne oczekiwanie na semafor */
-                struct sembuf sop = { .sem_num = SEM_CONV_EMPTY(pid), .sem_op = -1, .sem_flg = 0 };
-                while (semop(h.sem_id, &sop, 1) == -1) {
-                    if (errno == EINTR) {
-                        if (g_stop || g_evac) goto cleanup;
-                        continue;
-                    }
-                    perror("semop(baker EMPTY)");
-                    goto cleanup;
-                }
-                
-                if (g_stop || g_evac) {
-                    /* Oddaj semafor i wyjdź */
-                    sem_V(h.sem_id, SEM_CONV_EMPTY(pid));
-                    goto cleanup;
-                }
-                
+                sem_P(h.sem_id, SEM_CONV_EMPTY(pid));
                 sem_P(h.sem_id, SEM_CONV_MUTEX(pid));
 
                 /* Sekcja krytyczna: dopisac na tail (FIFO) */
@@ -149,22 +129,18 @@ int main(void) {
                 LOGF("piekarz", "Wypiek: %s x%d", st->produkty[i].nazwa, wyprodukowano[i]);
             }
         }
-        msleep(rand_between(100, 300)); 
+        msleep(rand_between(100, 300)); /* realistyczna przerwa między wypiekami */
     }
 
-cleanup:
     /* Inwentaryzacja: podsumowanie wytworzonych produktow */
-    /* Wypisz raport zawsze przy zamknięciu sklepu lub ewakuacji */
     shm_lock(h.sem_id);
     int inv = st->inventory_mode;
-    int closed = !st->store_open;
-    int evac = st->evacuated;
     shm_unlock(h.sem_id);
     
-    if (inv || closed || evac) {
+    if (inv) {
         fprintf(stdout, "\n" COLOR_PIEKARZ);
         fprintf(stdout, "╔══════════════════════════════════════════════════════════╗\n");
-        fprintf(stdout, "║       🥖 RAPORT PIEKARZA - WYPRODUKOWANE PRODUKTY        ║\n");
+        fprintf(stdout, "║       🥖 INWENTARYZACJA - PIEKARZ - WYPRODUKOWANE        ║\n");
         fprintf(stdout, "╠══════════════════════════════════════════════════════════╣\n");
         fprintf(stdout, ANSI_RESET);
         

@@ -5,12 +5,12 @@
  *
  * TRYBY PRACY:
  *   ./manager           - normalny tryb pracy (sklep otwarty wg godzin)
- *   ./manager test N    - test przeciazeniowy z N klientami (domyslnie 1000)
+ *   ./manager test N    - test przeciazeniowy z N klientami 
  *   ./manager stress    - test stresu z maksymalna liczba klientow
  */
 
-#define MAX_CLIENTS_TOTAL 500
-#define SPAWN_COOLDOWN_MS 200    /* minimalny odstep miedzy spawnem klientow (ms) */
+#define MAX_CLIENTS_TOTAL 1000000  /* praktycznie nieskończoność dla normalnego trybu */
+#define SPAWN_COOLDOWN_MS 0    /* minimalny odstep miedzy spawnem klientow (ms) - normalny tryb */
 
 /* Flagi trybu testowego */
 static int g_test_mode = 0;
@@ -21,13 +21,15 @@ static int g_test_client_count = 1000;
 static volatile sig_atomic_t g_sig_evac = 0;
 static volatile sig_atomic_t g_sig_inv  = 0;
 static volatile sig_atomic_t g_sig_term = 0;
+static volatile sig_atomic_t g_sig_chld = 0;
 
 static pid_t g_pgid = -1;
 
 static void signal_handler(int sig) {
-    if (sig == SIG_EVAC) g_sig_evac = 1;
+    if (sig == SIG_EVAC) { g_sig_evac = 1; g_common_stop = 1; }
     else if (sig == SIG_INV) g_sig_inv = 1;
-    else g_sig_term = 1; /* SIGINT / SIGTERM */
+    else if (sig == SIGCHLD) g_sig_chld = 1;
+    else { g_sig_term = 1; g_common_stop = 1; } /* SIGINT / SIGTERM */
 }
 
 /* =========================
@@ -75,10 +77,10 @@ static int desired_open_cashiers(const BakeryState* st) {
     int c = st->customers_in_store;
     int N = st->N;
 
-    int t1_on  = (N / 3) + 1;         
-    int t1_off = (N / 3) - 1;         
-    int t2_on  = (2 * N / 3) + 1;    
-    int t2_off = (2 * N / 3) - 1;    
+    int t1_on  = (N / 3) + 1;         /* np. 4 */
+    int t1_off = (N / 3) - 1;         /* np. 2 */
+    int t2_on  = (2 * N / 3) + 1;     /* np. 7 */
+    int t2_off = (2 * N / 3) - 1;     /* np. 5 */
 
     if (t1_off < 0) t1_off = 0;
     if (t2_off < 0) t2_off = 0;
@@ -150,13 +152,11 @@ static void ctrl_fifo_poll(int fd) {
     if (n <= 0) return;
     buf[n] = '\0';
 
-    /* Proste komendy: EVAC, INV, CLOSE, STATUS */
+    /* Proste komendy: EVAC, INV, STATUS */
     if (strstr(buf, "EVAC")) {
         g_sig_evac = 1;
     } else if (strstr(buf, "INV")) {
         g_sig_inv = 1;
-    } else if (strstr(buf, "CLOSE")) {
-        g_sig_term = 1;
     } else if (strstr(buf, "STATUS")) {
         /* Można rozszerzyć o wypisanie statusu */
     }
@@ -175,21 +175,33 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+static int g_reaped_count = 0;
+
 static void reap_children_nonblocking(void) {
     int status;
     pid_t pid;
+    int reaped_now = 0;
 
+    /* Zbieraj wszystkie zakończone dzieci w pętli */
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        if (WIFEXITED(status)) {
-            LOGF("kierownik", "Proces potomny pid=%d zakończył się kodem=%d",
-                 (int)pid, WEXITSTATUS(status));
-        } else if (WIFSIGNALED(status)) {
-            LOGF("kierownik", "Proces potomny pid=%d zakończony sygnałem=%d",
-                 (int)pid, WTERMSIG(status));
-        } else {
-            LOGF("kierownik", "Proces potomny pid=%d zakończony (status=%d)",
-                 (int)pid, status);
+        reaped_now++;
+        g_reaped_count++;
+        
+        /* W trybie stress/test nie loguj każdego dziecka - za wolne */
+        if (!g_stress_mode && !g_test_mode) {
+            if (WIFEXITED(status)) {
+                LOGF("kierownik", "Proces potomny pid=%d zakończył się kodem=%d",
+                     (int)pid, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                LOGF("kierownik", "Proces potomny pid=%d zakończony sygnałem=%d",
+                     (int)pid, WTERMSIG(status));
+            }
         }
+    }
+    
+    /* Loguj podsumowanie co 500 zebranych procesów */
+    if (g_stress_mode && reaped_now > 0 && (g_reaped_count % 500 < reaped_now)) {
+        LOGF("kierownik", "[REAP] Zebrano łącznie %d procesów potomnych", g_reaped_count);
     }
 
     /* waitpid == 0 -> brak zakończonych dzieci, waitpid == -1 -> np. brak dzieci (ECHILD) */
@@ -271,8 +283,8 @@ int main(int argc, char** argv) {
 
     int P = 15;
     int N = 30;        /* limit klientow w sklepie */
-    int Tp = 6;        /* otwarcie: 6:00 */
-    int Tk = 22;       /* zamkniecie: 22:00 */
+    int Tp = 0;        /* otwarcie: 0:00 (zawsze otwarty) */
+    int Tk = 24;       /* zamkniecie: 24:00 (nigdy nie zamknie automatycznie) */
     Product produkty[MAX_P];
     int Ki[MAX_P];
     int spawned_clients_total = 0;
@@ -458,19 +470,16 @@ int main(int argc, char** argv) {
         }
 
         /* Generacja klientow */
-        int should_spawn = g_test_mode ? 1 : (rand_between(0, 100) < 35);
+        int should_spawn = g_test_mode ? 1 : (rand_between(0, 100) < 50); /* 50% szans w normalnym trybie */
         if (should_spawn) {
             long long t = now_ms();
-
-            /* rate limit */
-            if (t - last_spawn_ms < SPAWN_COOLDOWN_MS) {
+            int cooldown = 0;  /* MAX SPAWN TEST */
+            if (t - last_spawn_ms < cooldown) {
                 /* za szybko - pomijamy */
-            } else if (spawned_clients_total >= max_clients) {
-                /* osiagnieto limit - zakonczmy test */
-                if (g_test_mode) {
-                    LOGF("kierownik", "Wygenerowano wszystkich %d klientow. Czekam na zakonczenie...", max_clients);
-                    break;
-                }
+            } else if (g_test_mode && spawned_clients_total >= max_clients) {
+                /* osiagnieto limit - tylko w trybie testowym */
+                LOGF("kierownik", "Wygenerowano wszystkich %d klientow. Czekam na zakonczenie...", max_clients);
+                break;
             } else {
                 /* Nie spawnuj po zamknieciu sklepu (lub po ewakuacji) */
                 shm_lock(h.sem_id);
@@ -483,15 +492,29 @@ int main(int argc, char** argv) {
                     g_stats.clients_spawned = spawned_clients_total;
                     last_spawn_ms = t;
                     
-                    /* W trybie stress spawnuj szybciej */
-                    if (!g_stress_mode && spawned_clients_total % 50 == 0) {
+                    /* Co 5 klientów zbierz zombie (bardziej agresywnie) */
+                    if (spawned_clients_total % 5 == 0) {
+                        reap_children_nonblocking();
+                    }
+                    
+                    /* Logowanie w normalnym trybie */
+                    if (!g_stress_mode && !g_test_mode && spawned_clients_total % 10 == 0) {
+                        LOGF("kierownik", "Nowy klient (lacznie: %d)", spawned_clients_total);
+                    } else if (!g_stress_mode && g_test_mode && spawned_clients_total % 50 == 0) {
                         LOGF("kierownik", "Nowy klient (lacznie: %d/%d)", spawned_clients_total, max_clients);
                     }
                 }
             }
         }
 
-        msleep(g_stress_mode ? 1 : 10); /* glowna petla */
+        /* Opóźnienie głównej pętli - w normalnym trybie wolniej */
+        if (g_stress_mode) {
+            msleep(1);
+        } else if (g_test_mode) {
+            msleep(10);
+        } else {
+            msleep(100); /* normalny tryb - wolniejsza symulacja */
+        }
     }
     
     /* ====== Faza zamykania ====== */
@@ -501,6 +524,7 @@ int main(int argc, char** argv) {
         LOGF("kierownik", "Czekam az klienci zrobia zakupy (sklep nadal otwarty)...");
         int wait_shopping = 0;
         while (wait_shopping < 50) { /* max 5 sekund */
+            reap_children_nonblocking();  /* zbieraj zombie podczas czekania */
             shm_lock(h.sem_id);
             int in_store = st->customers_in_store;
             shm_unlock(h.sem_id);
@@ -521,11 +545,20 @@ int main(int argc, char** argv) {
         st->cashier_accepting[i] = 0;
     }
     shm_unlock(h.sem_id);
+    
+    /* Wyslij sygnal SIGTERM do grupy procesow aby przerwac blokujace oczekiwania */
+    /* Kasjerzy i piekarz sprawdza store_open po otrzymaniu sygnalu i zakonczą prawidłowo */
+    LOGF("kierownik", "Wysylam SIGTERM do procesow potomnych.");
+    if (g_pgid > 0) {
+        kill(-g_pgid, SIGTERM);
+    }
 
     /* Czekaj az wszyscy klienci wyjda */
     int wait_counter = 0;
     int max_wait = g_test_mode ? 600 : 300; /* max 60s lub 30s */
     while (wait_counter < max_wait) {
+        reap_children_nonblocking();  /* zbieraj zombie podczas czekania */
+        
         shm_lock(h.sem_id);
         int in_store = st->customers_in_store;
         shm_unlock(h.sem_id);

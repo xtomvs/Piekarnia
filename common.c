@@ -139,6 +139,9 @@ void ipc_destroy_or_die(const IpcHandles* h, int P) {
  *  Semafory: P/V
  * ========================= */
 
+/* Globalna flaga stopu - ustawiana przez handlery sygnałów */
+volatile sig_atomic_t g_common_stop = 0;
+
 static void semop_or_die(int sem_id, unsigned short sem_num, short delta, int flags) {
     struct sembuf op;
     op.sem_num = sem_num;
@@ -146,7 +149,11 @@ static void semop_or_die(int sem_id, unsigned short sem_num, short delta, int fl
     op.sem_flg = (short)flags;
 
     while (semop(sem_id, &op, 1) == -1) {
-        if (errno == EINTR) continue;   /* przerwane sygnałem -> ponów */
+        if (errno == EINTR) {
+            if (g_common_stop) return;  /* sygnał stopu - nie ponawiaj */
+            continue;   /* inny sygnał -> ponów */
+        }
+        if (errno == EIDRM || errno == EINVAL) return;  /* IPC usunięte - cicho zakończ */
         DIE_PERROR("semop");
     }
 }
@@ -239,4 +246,8 @@ void install_signal_handlers_or_die(void (*handler)(int)) {
     /* sprzątanie po Ctrl+C */
     CHECK_SYS(sigaction(SIGINT, &sa, NULL), "sigaction(SIGINT)");
     CHECK_SYS(sigaction(SIGTERM, &sa, NULL), "sigaction(SIGTERM)");
+    
+    /* SIGCHLD dla zbierania zombie - bez blokowania */
+    sa.sa_flags = SA_NOCLDSTOP;  /* nie reaguj na zatrzymanie dziecka */
+    CHECK_SYS(sigaction(SIGCHLD, &sa, NULL), "sigaction(SIGCHLD)");
 }

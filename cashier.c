@@ -11,12 +11,13 @@
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_evac = 0;
 static void handler(int sig) {
-    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; }
+    if (sig == SIG_EVAC) { g_evac = 1; g_stop = 1; g_common_stop = 1; }
     else if (sig == SIG_INV) {
         /* inwentaryzacja: nie zatrzymuje procesów */
         return;
     } else {
         g_stop = 1; /* SIGINT / SIGTERM */
+        g_common_stop = 1;
     }
 }
 
@@ -59,8 +60,10 @@ static void send_reply(int msg_id, pid_t client_pid, int cashier_id, double tota
     reply.total_price = total_price;
     reply.success = success;
     
-    if (msgsnd(msg_id, &reply, sizeof(CashierReply) - sizeof(long), 0) == -1) {
-        perror("msgsnd(reply to client)");
+    if (msgsnd(msg_id, &reply, sizeof(CashierReply) - sizeof(long), IPC_NOWAIT) == -1) {
+        if (errno != EIDRM && errno != EINVAL && errno != EAGAIN) {
+            perror("msgsnd(reply to client)");
+        }
     }
 }
 
@@ -83,8 +86,7 @@ static double process_sale(BakeryState* st, int sem_id, int cashier_id, const Cl
     shm_unlock(sem_id);
 
     /* Symulacja kasowania - czas proporcjonalny do liczby pozycji */
-    int kasowanie_ms = 300 + msg->item_count * 150;
-    msleep(kasowanie_ms);
+    msleep(rand_between(200, 400) + msg->item_count * 50);
     
     return total_price;
 }
@@ -153,17 +155,18 @@ int main(int argc, char** argv) {
         /* Zamknięcie sklepu: dokończ kolejkę i wyjdź */
         if (!store_open) {
             LOGF("kasjer", "Sklep zamknięty – opróżniam kolejkę i kończę pracę.");
-            while (1) {
+            while (!g_stop) {
                 ClientMsg msg;
                 ssize_t r = msgrcv(h.msg_id[cashier_id], &msg, sizeof(ClientMsg) - sizeof(long), 0, IPC_NOWAIT);
                 if (r == -1) {
                     if (errno == ENOMSG) break;
                     if (errno == EINTR) continue;
+                    if (errno == EIDRM || errno == EINVAL) break;  /* IPC zniszczone */
                     perror("msgrcv (drain on store close)");
                     break;
                 }
                 
-                if (g_evac) {
+                if (g_evac || g_stop) {
                     /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
                     shm_lock(h.sem_id);
                     if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
@@ -206,17 +209,18 @@ int main(int argc, char** argv) {
                 said_not_accepting = 1;
             }
             int processed_any = 0;
-            while (1) {
+            while (!g_stop) {
                 ClientMsg msg;
                 ssize_t r = msgrcv(h.msg_id[cashier_id], &msg, sizeof(ClientMsg) - sizeof(long), 0, IPC_NOWAIT);
                 if (r == -1) {
                     if (errno == ENOMSG) break;
                     if (errno == EINTR) continue;
+                    if (errno == EIDRM || errno == EINVAL) break;  /* IPC zniszczone */
                     perror("msgrcv (drain on close-for-new)");
                     break;
                 }
                 processed_any = 1;
-                if (g_evac) {
+                if (g_evac || g_stop) {
                     /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
                     shm_lock(h.sem_id);
                     if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
@@ -252,11 +256,12 @@ int main(int argc, char** argv) {
         ssize_t r = msgrcv(h.msg_id[cashier_id], &msg, sizeof(ClientMsg) - sizeof(long), 0, 0);
         if (r == -1) {
             if (errno == EINTR) continue;
+            if (errno == EIDRM || errno == EINVAL) break;  /* IPC zniszczone */
             perror("msgrcv");
             break;
         }
 
-        if (g_evac) {
+        if (g_evac || g_stop) {
             /* wiadomość zdjęta z kolejki MQ, więc licznik też zmniejszamy */
             shm_lock(h.sem_id);
             if (st->cashier_queue_len[cashier_id] > 0) st->cashier_queue_len[cashier_id]--;
